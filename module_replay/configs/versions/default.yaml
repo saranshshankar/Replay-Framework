@@ -1,5 +1,5 @@
 # Default version spec: everything follows 10xCode dev.
 # Omitted submodules use the commit pinned by 10xCode's dev branch.
 tenxcode:
-  branch: aniket/feat/perception_metric_test
+  branch: dev
 # submodules: (omitted - all pinned from dev)

@@ -1,6 +1,7 @@
 """CLI entry point for the replay platform."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -198,9 +199,20 @@ def all_cmd(
     )
     result = run_replay(module=module_spec, data=data_ref, output_dir=output_dir)
     click.echo(f"Output bag: {result.output_bag_path}")
+    if result.exit_code != 0:
+        # EXIT-CODE CONTRACT (SYSTEM-DESIGN-HLD-LLD B9): the process exit code is
+        # the CI signal. 1 and 2 are RESERVED for the metrics verdict (quality
+        # FAIL / INVALID RUN, plan 01-07). Any replay/setup failure maps to 3,
+        # with the underlying container code echoed for diagnosis.
+        click.echo(
+            f"Replay failed (container exit code {result.exit_code}) "
+            "— exiting 3 (setup/replay error)",
+            err=True,
+        )
+        sys.exit(3)
 
     if run_metrics:
-        click.echo("Metrics requested - not implemented yet.")
+        click.echo("Metrics requested - not implemented yet.")  # wired in plan 01-07
     if run_viz:
         click.echo("Viz requested - not implemented yet.")
 

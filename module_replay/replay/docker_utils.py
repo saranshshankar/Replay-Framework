@@ -59,11 +59,17 @@ def compose_up(
     )
 
 
-def exec_in_container(container: str, shell_cmd: str) -> None:
-    """Execute `shell_cmd` inside the named running container using bash -lc.
+def exec_in_container(container: str, shell_cmd: str) -> int:
+    """Execute `shell_cmd` inside the named container; return its exit code.
 
-    The `-i` flag keeps stdin attached so SIGINT from the host terminal
-    propagates into the container's shell — needed for the runner's
-    trap-based cleanup to fire on Ctrl-C.
+    Does NOT raise on non-zero — the caller (runner.py) propagates the code
+    into RunResult so the CLI (and CI gate) sees the true replay outcome
+    instead of a swallowed exit 0. The `-i` flag keeps stdin attached so a
+    host SIGINT propagates into the container's shell — needed for the
+    runner's trap-based cleanup to fire on Ctrl-C.
     """
-    run_cmd(["docker", "exec", "-i", container, "bash", "-lc", shell_cmd])
+    result = subprocess.run(
+        ["docker", "exec", "-i", container, "bash", "-lc", shell_cmd],
+        text=True,
+    )
+    return result.returncode

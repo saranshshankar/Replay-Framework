@@ -1,0 +1,14 @@
+# QoS profile overrides for `ros2 bag play --qos-profile-overrides-path`.
+# /tf_static must be republished transient_local so perception sees the latched
+# static TFs during its on_configure window (the bag is the only source of the
+# *_corrected frames — KT/playbooks/01-perception.md Step 4). /tf stays volatile.
+/tf_static:
+  durability: transient_local
+  history: keep_all
+  reliability: reliable
+
+/tf:
+  durability: volatile
+  history: keep_last
+  depth: 100
+  reliability: reliable

@@ -121,3 +121,72 @@ def test_run_replay_missing_input_bag_raises(tmp_path: Path, perception_spec):
     data_ref = DataRef(local_path=tmp_path / "does_not_exist", source="local")
     with pytest.raises(FileNotFoundError):
         run_replay(module=perception_spec, data=data_ref, output_dir=tmp_path / "out")
+
+
+def _staged_bag(tmp_path: Path) -> DataRef:
+    """A bag outside HOST_BAG_LIBRARY so the runner takes the copy path."""
+    bag = tmp_path / "bag_in"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    return DataRef(local_path=bag, source="local")
+
+
+def _run_and_capture_script(tmp_path: Path, perception_spec, mocker, exit_code: int = 0) -> tuple:
+    """Run run_replay with all side-effects mocked; return (result, generated_script)."""
+    mocker.patch("replay.runner.paths.HOST_BAG_LIBRARY", tmp_path / "elsewhere")
+    data_ref = _staged_bag(tmp_path)
+    exec_mock = mocker.patch("replay.runner.exec_in_container", return_value=exit_code)
+    mocker.patch("replay.runner.shutil.move")
+    mocker.patch("replay.runner.shutil.copytree")
+    result = run_replay(module=perception_spec, data=data_ref, output_dir=tmp_path / "out")
+    _, script = exec_mock.call_args.args
+    return result, script
+
+
+def test_run_replay_exit_code_propagated(tmp_path: Path, perception_spec, mocker):
+    """FRWK-03: runner returns the container exit code, not hardcoded 0."""
+    result, _ = _run_and_capture_script(tmp_path, perception_spec, mocker, exit_code=1)
+    assert result.exit_code == 1
+
+
+def test_run_replay_exit_code_zero_when_clean(tmp_path: Path, perception_spec, mocker):
+    """FRWK-03: a clean replay (container exit 0) still reports 0."""
+    result, _ = _run_and_capture_script(tmp_path, perception_spec, mocker, exit_code=0)
+    assert result.exit_code == 0
+
+
+def test_build_replay_script_has_queue_size(tmp_path: Path, perception_spec, mocker):
+    """RPLY-01: --read-ahead-queue-size 5000 present (the documented stall fix)."""
+    _, script = _run_and_capture_script(tmp_path, perception_spec, mocker)
+    assert "--read-ahead-queue-size 5000" in script
+
+
+def test_build_replay_script_has_qos_override_flag(tmp_path: Path, perception_spec, mocker):
+    """RPLY-01: QoS override flag present so /tf_static is latched transient_local."""
+    _, script = _run_and_capture_script(tmp_path, perception_spec, mocker)
+    assert "--qos-profile-overrides-path" in script
+
+
+def test_build_replay_script_no_fixed_sleep(tmp_path: Path, perception_spec, mocker):
+    """RPLY-04: no 'sleep 3'; readiness loop present; no --pause."""
+    _, script = _run_and_capture_script(tmp_path, perception_spec, mocker)
+    assert "sleep 3" not in script
+    assert "ros2 topic list" in script   # post-launch readiness loop
+    assert "--pause" not in script        # paused player would drop latched /tf_static
+
+
+def test_build_replay_script_records_mcap(tmp_path: Path, perception_spec, mocker):
+    """RESEARCH Standard Stack: newly recorded output bags use MCAP, not sqlite3 .db3."""
+    _, script = _run_and_capture_script(tmp_path, perception_spec, mocker)
+    assert "--storage mcap" in script
+
+
+def test_build_replay_script_preserves_cleanup_invariant(tmp_path: Path, perception_spec, mocker):
+    """The setsid + trap + kill escalation block must survive the hardening edits."""
+    _, script = _run_and_capture_script(tmp_path, perception_spec, mocker)
+    assert "trap cleanup EXIT INT TERM" in script
+    assert "kill -INT" in script
+    assert "kill -KILL" in script
+    assert "setsid ros2 bag record" in script
+    assert "setsid ros2 bag play" in script
+    assert "wait $PLAY_PID" in script

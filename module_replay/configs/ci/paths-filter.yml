@@ -1,0 +1,22 @@
+# Touched-module detection (CI-05, RESEARCH Gray Area 4 #2).
+# Consumed by the replay-gate `detect` job via dorny/paths-filter@v4.0.1.
+#
+# 'framework' matches changes that affect ALL modules -> the gate fans out and
+# runs every module. Per-module keys (perception, ...) select only that module
+# when its own config/metric-pack/baseline files change.
+framework:
+  - 'module_replay/replay/cli.py'
+  - 'module_replay/replay/runner.py'
+  - 'module_replay/replay/docker_utils.py'
+  - 'module_replay/replay/executor.py'
+  - 'module_replay/replay/module_config.py'
+  - 'module_replay/replay/metrics/base.py'
+  - 'module_replay/replay/metrics/registry.py'
+  - 'module_replay/replay/metrics/bag_reader.py'
+  - 'module_replay/replay/metrics/report/**'
+  - 'module_replay/replay/isolation/**'
+perception:
+  - 'module_replay/configs/modules/perception.yaml'
+  - 'module_replay/configs/qos/perception.yaml'
+  - 'module_replay/replay/metrics/perception/**'
+  - 'module_replay/configs/baselines/perception/**'

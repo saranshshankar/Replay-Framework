@@ -83,6 +83,24 @@ pip install -e '.[dev]'
 Note: `dev` here is a Python packaging convention, unrelated to the `dev`
 branch of 10xCode.
 
+### Running tests
+
+Install the test dependencies (`pip install -e '.[dev,metrics]'`) and run:
+
+```bash
+python3 -m pytest tests/
+```
+
+The integration smoke test (`tests/test_integration_smoke.py`) needs a real
+rosbag2 directory to exercise the full CLI path. It reads that path from the
+`REPLAY_INTEGRATION_BAG_PATH` environment variable and **skips cleanly when the
+variable is unset** — no machine-specific path is hardcoded:
+
+```bash
+# Optional: point the integration smoke test at a local rosbag2 directory.
+export REPLAY_INTEGRATION_BAG_PATH=/path/to/rosbag2_2026_04_09-18_44_09
+```
+
 ### CLI overview
 
 ```bash

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from replay.env_setup import (
+    CONTROLLER_REPLAY_OVERRIDE,
     PLANNER_REPLAY_OVERRIDE,
     TENXCODE_PLANNER_OVERRIDE,
     setup_environment,
@@ -180,3 +181,30 @@ def test_setup_partial_checkout_uses_paths_and_skips_recursive(perception_spec, 
     # Full-tree git operations are not run.
     full_checkout.assert_not_called()
     recursive_submodule.assert_not_called()
+
+
+def test_replay_override_files_have_no_hardcoded_host_paths():
+    """FRWK-02: the .replay_work bind mount must not assume any developer's
+    home directory — the host side comes from the REPLAY_WORK_DIR env var."""
+    for override in (PLANNER_REPLAY_OVERRIDE, CONTROLLER_REPLAY_OVERRIDE):
+        text = override.read_text()
+        assert "/home/" not in text, f"{override.name} hardcodes a host home path"
+        assert "${REPLAY_WORK_DIR" in text, f"{override.name} missing REPLAY_WORK_DIR mount"
+
+
+def test_setup_exports_replay_work_dir_for_compose(perception_spec, mocker, monkeypatch):
+    """setup_environment must export REPLAY_WORK_DIR (derived portably from
+    paths.HOST_REPLAY_WORKDIR) so docker compose interpolates the work mount."""
+    import os
+
+    mocker.patch("replay.env_setup.compose_up")
+    mocker.patch("replay.env_setup.checkout_branch")
+    mocker.patch("replay.env_setup.submodule_update_recursive")
+    mocker.patch("replay.env_setup.exec_in_container")
+    monkeypatch.delenv("REPLAY_WORK_DIR", raising=False)
+
+    spec = VersionSpec(tenxcode_branch="dev", submodule_overrides=[])
+    setup_environment(spec, perception_spec)
+
+    from replay import paths
+    assert os.environ["REPLAY_WORK_DIR"] == str(paths.HOST_REPLAY_WORKDIR)

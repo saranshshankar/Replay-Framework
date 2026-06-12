@@ -1,6 +1,8 @@
 """Environment setup: docker compose + git checkout + colcon build."""
 from __future__ import annotations
 
+import os
+
 from replay import paths
 from replay.docker_utils import (
     compose_up,
@@ -112,6 +114,11 @@ def setup_environment(
         _apply_full_checkout(version)
     else:
         _apply_partial_checkout(version, checkout_paths)
+
+    # The replay override files mount ${REPLAY_WORK_DIR} as the host side of
+    # the work dir — derive it portably so the mount works on any machine
+    # (FRWK-02). setdefault keeps an explicit user export authoritative.
+    os.environ.setdefault("REPLAY_WORK_DIR", str(paths.HOST_REPLAY_WORKDIR))
 
     compose_up(compose_file, overrides=overrides, pull_policy="missing")
 

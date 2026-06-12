@@ -305,6 +305,11 @@ def test_all_cmd_propagates_nonzero_exit(tmp_path: Path, mocker):
     bag.mkdir()
     (bag / "metadata.yaml").write_text("version: 5")
     mocker.patch("replay.cli.setup_environment")
+    # The real perception.yaml lists robot-only preflight assets (.trt/LUTs/param
+    # tree) that don't exist on dev/CI machines; without this mock the CLI would
+    # exit 3 at the preflight gate before reaching run_replay, masking the intent
+    # of this test (a non-zero REPLAY exit -> 3).
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[])
     mocker.patch(
         "replay.cli.run_replay",
         return_value=RunResult(output_bag_path=bag, exit_code=137),
@@ -319,3 +324,113 @@ def test_all_cmd_propagates_nonzero_exit(tmp_path: Path, mocker):
         ],
     )
     assert r.exit_code == 3, r.output   # B9: replay failures map to 3
+
+
+def test_all_cmd_preflight_gate_fails_named_path(tmp_path: Path, mocker):
+    """B5/C1 fail-fast: a missing preflight asset exits 3 with the path named in stderr."""
+    from replay.runner import RunResult
+
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    mocker.patch("replay.cli.setup_environment")
+    missing_path = "/nonexistent/perception/models/segformer.trt"
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[missing_path])
+    run_mock = mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=bag, exit_code=0),
+    )
+    r = CliRunner().invoke(
+        main,
+        [
+            "all",
+            "--module", "perception",
+            "--local-bag", str(bag),
+            "--output", str(tmp_path / "out"),
+        ],
+    )
+    assert r.exit_code == 3, r.output
+    assert missing_path in r.output
+    run_mock.assert_not_called()   # gate fires BEFORE replay
+
+
+def test_all_cmd_empty_preflight_proceeds_to_replay(tmp_path: Path, mocker):
+    """An empty preflight_assets list lets replay proceed (mocked)."""
+    from replay.runner import RunResult
+
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    mocker.patch("replay.cli.setup_environment")
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[])
+    run_mock = mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=bag, exit_code=0),
+    )
+    r = CliRunner().invoke(
+        main,
+        [
+            "all",
+            "--module", "perception",
+            "--local-bag", str(bag),
+            "--output", str(tmp_path / "out"),
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    run_mock.assert_called_once()
+
+
+def test_all_run_metrics_produces_report(tmp_path: Path, synthetic_bag, mocker):
+    """--run-metrics runs the registered perception plugins + faithfulness,
+    generates the report, and echoes the verdict (MTRC-03/MTRC-05).
+
+    Uses the real default configs dir (perception.yaml thresholds from 01-03 +
+    the plugin pack from 01-05). missing_preflight_assets is mocked to [] so the
+    preflight gate doesn't exit 3 on the dev/CI machine's missing robot assets.
+    """
+    from replay.runner import RunResult
+
+    mocker.patch("replay.cli.setup_environment")
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[])
+    mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=synthetic_bag, exit_code=0),
+    )
+    out = tmp_path / "out"
+    r = CliRunner().invoke(
+        main,
+        [
+            "all",
+            "--module", "perception",
+            "--local-bag", str(synthetic_bag),
+            "--output", str(out),
+            "--run-metrics",
+        ],
+    )
+    assert "Verdict:" in r.output, r.output
+    assert (out / "reports" / "metrics.json").exists()
+
+
+def test_metrics_subcommand_offline_produces_report(tmp_path: Path, synthetic_bag):
+    """Standalone `metrics` subcommand (B9/CI-01): offline, no preflight, no replay.
+
+    Computes metrics on an EXISTING output bag and writes reports/metrics.json.
+    """
+    import json
+
+    out = tmp_path / "out"
+    r = CliRunner().invoke(
+        main,
+        [
+            "metrics",
+            "--module", "perception",
+            "--bag", str(synthetic_bag),
+            "--output", str(out),
+        ],
+    )
+    assert "Verdict:" in r.output, r.output
+    metrics_json = out / "reports" / "metrics.json"
+    assert metrics_json.exists()
+    doc = json.loads(metrics_json.read_text())
+    assert doc["module"] == "perception"
+    assert "pass" in doc and "verdict" in doc

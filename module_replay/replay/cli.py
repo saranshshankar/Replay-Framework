@@ -9,12 +9,77 @@ import click
 
 from replay.data_manager import resolve_local_bag, resolve_s3_bag
 from replay.env_setup import DEFAULT_BUILD_JOBS, setup_environment
-from replay.module_config import load_checkout_paths, load_module_config
+from replay.module_config import (
+    load_checkout_paths,
+    load_module_config,
+    missing_preflight_assets,
+)
 from replay.runner import run_replay
 from replay.version_manager import load_version_spec
 
 DEFAULT_CONFIGS_DIR = Path(__file__).resolve().parent.parent / "configs"
 DEFAULT_VERSION_YAML_NAME = "default.yaml"
+
+# Map the report generator's B9 exit code to a human-readable verdict for the
+# CLI echo. 0 = PASS, 1 = quality FAIL, 2 = INVALID RUN (validity tier breach).
+_VERDICT_LABELS = {0: "PASS", 1: "FAIL", 2: "INVALID RUN"}
+
+
+def _run_metrics_pipeline(module_spec, bag_path: Path, output_dir: Path) -> int:
+    """Run the registered perception plugins + faithfulness over an output bag,
+    generate the report, and return the B9 exit code.
+
+    Shared by `all --run-metrics` (post-replay) and the standalone `metrics`
+    subcommand (offline, on a downloaded output bag — no replay/Docker/GPU).
+    """
+    import replay.metrics.perception  # noqa: F401 — import triggers plugin self-registration for all 7
+    from replay.metrics.base import MetricResult
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.registry import get_metric_plugins
+    from replay.metrics.replay_faithfulness import ReplayFaithfulnessMetric
+    from replay.metrics.report.generator import generate_report
+
+    topics = list(module_spec.input_topics) + list(module_spec.output_topics)
+    reader = BagReader(bag_path, topics)
+    cfg = {
+        "input_topics": module_spec.input_topics,
+        "output_topics": module_spec.output_topics,
+    }
+
+    # Validity tier: faithfulness is invoked EXPLICITLY (it is deliberately not
+    # registered as a quality plugin — 01-06), so it gates as the validity tier.
+    faithfulness = ReplayFaithfulnessMetric().compute(reader, cfg)
+
+    results = []
+    for plugin_cls in get_metric_plugins(module_spec.name):
+        plugin = plugin_cls()
+        if getattr(plugin, "requires_baseline", False):
+            # Regression metrics gate via compare(candidate, baseline); the
+            # baseline (--baseline) wiring lands in MOD-01 e2e / Phase 2.
+            continue
+        value = plugin.compute(reader, cfg)
+        results.append(
+            MetricResult(
+                name=plugin.name,
+                module=module_spec.name,
+                value=value,
+                passed=True,
+                is_regression=False,
+            )
+        )
+
+    reports_dir = output_dir / "reports"
+    rc = generate_report(
+        module=module_spec.name,
+        run_id=str(output_dir.name),
+        metric_results=results,
+        output_dir=reports_dir,
+        thresholds=module_spec.thresholds,
+        faithfulness=faithfulness,
+    )
+    click.echo(f"Metrics report: {reports_dir / 'report.html'}")
+    click.echo(f"Verdict: {_VERDICT_LABELS[rc]}")
+    return rc
 
 
 def _resolve_version_yaml(configs_dir: Path, version_yaml: Optional[Path]) -> Optional[Path]:
@@ -197,6 +262,16 @@ def all_cmd(
         checkout_paths=paths_to_checkout,
         build_jobs=build_jobs,
     )
+
+    # B5 phase-0 fail-fast (contract C1): a missing TensorRT engine / camera
+    # intrinsics LUT / config-current param tree must die HERE with the path
+    # named — never as a deep on_activate mystery inside the container. This is
+    # a named setup error (exit 3), distinct from the metrics verdict (1/2).
+    missing = missing_preflight_assets(module_spec)
+    if missing:
+        click.echo("Pre-flight failed — missing assets:\n  " + "\n  ".join(missing), err=True)
+        sys.exit(3)
+
     result = run_replay(module=module_spec, data=data_ref, output_dir=output_dir)
     click.echo(f"Output bag: {result.output_bag_path}")
     if result.exit_code != 0:
@@ -212,9 +287,30 @@ def all_cmd(
         sys.exit(3)
 
     if run_metrics:
-        click.echo("Metrics requested - not implemented yet.")  # wired in plan 01-07
+        rc = _run_metrics_pipeline(module_spec, result.output_bag_path, output_dir)
+        if rc != 0:
+            sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
     if run_viz:
-        click.echo("Viz requested - not implemented yet.")
+        click.echo("Viz requested - not implemented yet.")  # viz wiring deferred to MOD-01 e2e
+
+
+@main.command("metrics")
+@click.option("--module", required=True, type=click.Choice(["perception", "navigation", "manipulation"]))
+@click.option("--bag", "bag_path", required=True, type=click.Path(path_type=Path, exists=True))
+@click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
+@click.option("--configs-dir", type=click.Path(path_type=Path, exists=True), default=DEFAULT_CONFIGS_DIR)
+def metrics_cmd(module: str, bag_path: Path, output_dir: Path, configs_dir: Path) -> None:
+    """Offline evaluation of an EXISTING output bag: plugins -> criteria -> report + exit code.
+
+    The CHEAP runner (B9 CLI table / CI-01): no replay, no Docker, no GPU, and
+    no preflight asset gate (it needs no robot assets) — just the offline
+    metrics pipeline over a downloaded output bag, exiting per the B9 verdict.
+    """
+    module_spec = load_module_config(module, configs_dir / "modules")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rc = _run_metrics_pipeline(module_spec, bag_path, output_dir)
+    if rc != 0:
+        sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
 
 
 if __name__ == "__main__":

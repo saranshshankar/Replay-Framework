@@ -1,0 +1,51 @@
+name: replay-nightly
+# CI-02 nightly smoke: replay one fixed perception bag and assert green, then
+# replay it a SECOND time and assert per-metric deltas are within tolerance_band
+# (SC4 determinism / RPLY-03).
+#
+# SECURITY: AWS auth is OIDC only (id-token: write); NO long-lived keys in
+# secrets (T-08-02). The role is least-privilege (ECR pull + S3 bag READ; T-08-03).
+on:
+  schedule:
+    - cron: "0 7 * * *"   # nightly
+  workflow_dispatch: {}
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  smoke:
+    runs-on: [self-hosted, gpu, linux]   # Q-J: platform-team owned; prefer --ephemeral runners (T-08-04)
+    env: { MODULE: perception }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Smoke replay one fixed bag + assert green
+        run: |
+          cd module_replay
+          replay-module all --module "$MODULE" --local-bag /mnt/bags/perception_ci \
+            --output /tmp/nightly --run-metrics
+          python -c "import json,sys; d=json.load(open('/tmp/nightly/reports/metrics.json')); sys.exit(0 if d['pass'] else 1)"
+      - name: Determinism check — second replay, metric deltas within tolerance (SC4, RPLY-03)
+        run: |
+          cd module_replay
+          replay-module all --module "$MODULE" --local-bag /mnt/bags/perception_ci \
+            --output /tmp/nightly2 --run-metrics
+          python - <<'EOF'
+          import json, sys
+          a = json.load(open('/tmp/nightly/reports/metrics.json'))
+          b = json.load(open('/tmp/nightly2/reports/metrics.json'))
+          rows_a = {m['name']: m for m in a['metrics'] if m.get('value') is not None}
+          rows_b = {m['name']: m for m in b['metrics'] if m.get('value') is not None}
+          bad = []
+          for name in rows_a.keys() & rows_b.keys():
+              tol = rows_a[name].get('tolerance_band') or 0.0
+              delta = abs(float(rows_a[name]['value']) - float(rows_b[name]['value']))
+              if delta > tol:
+                  bad.append(f"{name}: |delta|={delta:.4f} > tolerance_band={tol}")
+          print("determinism deltas:", {n: abs(float(rows_a[n]['value']) - float(rows_b[n]['value'])) for n in rows_a.keys() & rows_b.keys()})
+          sys.exit(1 if bad else 0)
+          EOF

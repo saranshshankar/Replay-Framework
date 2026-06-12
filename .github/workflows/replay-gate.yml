@@ -1,0 +1,97 @@
+name: replay-gate
+# PR gate (CI-01/CI-03/CI-05). Four jobs:
+#   detect  -> changed-path -> module set (dorny/paths-filter)
+#   replay  -> GPU runner: replay ONLY, produces the output-bag artifact
+#   metrics -> cheap runner: downloads the artifact, COMPUTES metrics, gates
+#   gate    -> single summary check for branch protection (if: always())
+#
+# SECURITY (BLOCK-WORTHY): the trigger below is the safe PR event (checks out PR
+# code WITHOUT the base repo's secrets) — never the secret-bearing target
+# variant, which would enable secret exfiltration (T-08-01). AWS auth is OIDC
+# only (the id-token write permission below); NO long-lived AWS keys in secrets
+# (T-08-02).
+on:
+  pull_request:            # safe PR event only (no secret-bearing target variant)
+permissions:
+  id-token: write          # OIDC federation for ECR (no long-lived keys)
+  contents: read
+  pull-requests: write     # to post the report comment
+
+jobs:
+  detect:
+    runs-on: ubuntu-22.04
+    outputs:
+      perception: ${{ steps.filter.outputs.perception }}
+      framework: ${{ steps.filter.outputs.framework }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v4.0.1
+        with:
+          filters: module_replay/configs/ci/paths-filter.yml
+
+  replay:
+    needs: detect
+    if: ${{ needs.detect.outputs.perception == 'true' || needs.detect.outputs.framework == 'true' }}
+    runs-on: [self-hosted, gpu, linux]   # Q-J: provisioned by platform team; prefer --ephemeral runners (T-08-04)
+    env:
+      MODULE: perception
+      TASK_ID: ${{ vars.PERCEPTION_TEST_BAG_TASK_ID }}   # CI-04; decoupled from workflow code
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_ROLE_ARN }}       # scoped: ECR pull + S3 bag READ only (T-08-03)
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Replay (local pre-staged bag until Q-F/Q-K resolve)
+        run: |
+          cd module_replay
+          # replay ONLY (no --run-metrics) — the cheap metrics job computes the
+          # metrics; computing them here would defeat the two-job cost split (CI-01).
+          replay-module all --module "$MODULE" --local-bag /mnt/bags/perception_ci \
+            --output /tmp/output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: output-bag-${{ env.MODULE }}-${{ github.run_id }}
+          path: /tmp/output
+
+  metrics:
+    needs: replay
+    runs-on: ubuntu-22.04                  # cheap; no GPU; no ROS; no secrets (T-08-04)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: cd module_replay && pip install -e ".[metrics]"
+      - uses: actions/download-artifact@v4
+        with:
+          name: output-bag-perception-${{ github.run_id }}
+          path: /tmp/output
+      - name: Compute metrics on the cheap runner (CI-01 — the GPU job only replayed)
+        run: |
+          cd module_replay
+          # `metrics` writes <output>/reports/metrics.json + report.html (01-07).
+          replay-module metrics --module perception \
+            --bag /tmp/output/replay_output --output /tmp/metrics
+      - name: Gate on verdict
+        run: |
+          python -c "import json,sys; d=json.load(open('/tmp/metrics/reports/metrics.json')); sys.exit(0 if d['pass'] else 1)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-perception-${{ github.run_id }}
+          path: /tmp/metrics/reports
+
+  gate:
+    needs: [detect, replay, metrics]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Summarize (single required check for branch protection)
+        run: |
+          # If perception/framework wasn't touched, replay is skipped -> pass.
+          if [ "${{ needs.detect.outputs.perception }}" != "true" ] && [ "${{ needs.detect.outputs.framework }}" != "true" ]; then
+            echo "No module touched; gate passes."; exit 0
+          fi
+          [ "${{ needs.replay.result }}" = "success" ] && [ "${{ needs.metrics.result }}" = "success" ] || exit 1

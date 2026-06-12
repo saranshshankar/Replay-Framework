@@ -1,3 +1,14 @@
 .planning
 KT
 CLAUDE.md
+
+# Python build / virtualenv / cache artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.replay_work/
+build/
+dist/

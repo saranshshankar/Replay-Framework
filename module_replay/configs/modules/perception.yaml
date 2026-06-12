@@ -1,0 +1,43 @@
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics:
+  - /perception_node/camera_0/image_raw
+  - /perception_node/camera_1/image_raw
+  - /perception_node/camera_2/image_raw
+  - /perception_node/camera_3/image_raw
+  - /perception_node/camera_4/image_raw
+  - /perception_node/camera_5/image_raw
+  - /perception_node/lidar_107/points
+  - /perception_node/lidar_108/points
+  - /perception_node/lidar_107/imu/data
+  - /perception_node/lidar_108/imu/data
+  - /tf
+  - /tf_static
+output_topics:
+  - /perception_node/camera_0/image_raw_sim
+  - /perception_node/camera_1/image_raw_sim
+  - /perception_node/camera_2/image_raw_sim
+  - /perception_node/camera_3/image_raw_sim
+  - /perception_node/camera_4/image_raw_sim
+  - /perception_node/camera_5/image_raw_sim
+  - /perception_node/camera_0/semantic_raw_sim
+  - /perception_node/camera_1/semantic_raw_sim
+  - /perception_node/camera_2/semantic_raw_sim
+  - /perception_node/camera_3/semantic_raw_sim
+  - /perception_node/camera_4/semantic_raw_sim
+  - /perception_node/camera_5/semantic_raw_sim
+  - /perception_node/camera_0/depth_raw_sim
+  - /perception_node/camera_1/depth_raw_sim
+  - /perception_node/camera_2/depth_raw_sim
+  - /perception_node/camera_3/depth_raw_sim
+  - /perception_node/camera_4/depth_raw_sim
+  - /perception_node/camera_5/depth_raw_sim
+  - /perception_node/lidar_107/points_sim
+  - /perception_node/lidar_108/points_sim
+  - /perception_node/pointcloud_merged_sim
+  - /perception_node/colored_pointcloud_sim
+  - /perception_node/lidar_107/imu/data_sim
+  - /perception_node/lidar_108/imu/data_sim
+launch:
+  command: "ros2 launch realtime_perception perception_node.launch.py use_replay:=true"

@@ -1,0 +1,14 @@
+# replay/compose/controller.replay.override.yml
+services:
+  origin_control_system:
+    volumes:
+      - /home/bharat/workspace/src/module_replay/.replay_work:/root/ros2_ws/replay_work
+      # Bag library mount (read-only) — runner plays bags directly from here
+      # to skip the multi-GB copy into .replay_work. Override per-user via
+      # REPLAY_BAG_LIBRARY env var.
+      - ${REPLAY_BAG_LIBRARY:-/home/bharat/data}:/root/data:ro
+    environment:
+      # Pin a non-default domain to isolate replay traffic from anything else
+      # on the host's domain 0 (the controller compose uses network_mode: host).
+      # Override per-run via REPLAY_ROS_DOMAIN_ID env var if needed.
+      ROS_DOMAIN_ID: "${REPLAY_ROS_DOMAIN_ID:-42}"

@@ -1,0 +1,12 @@
+name: manipulation
+container: controller
+colcon_package: manipulation_manager
+input_topics:
+  - /sensor_fusion/local_semantic_map
+  - /arm/joint_states
+  - /tf
+  - /tf_static
+output_topics:
+  - /manipulation/trajectory
+launch:
+  command: "ros2 launch manipulation_manager manipulation.launch.py mode:=sim"

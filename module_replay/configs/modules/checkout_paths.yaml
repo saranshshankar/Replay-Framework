@@ -1,0 +1,16 @@
+# Per-module list of 10xCode-relative paths to check out when
+# --partial-checkout is passed to `setup-env` or `all`.
+#
+# A partial checkout uses `git checkout <branch> -- <paths>` — it updates only
+# the listed paths in the working tree; files outside the list are left as-is.
+# Submodules listed here also trigger `git submodule update --init <path>` so
+# the submodule contents are fetched (not just the gitlink).
+perception:
+  - perception/
+  - common_interfaces/
+navigation:
+  - navigation/
+  - common_interfaces/
+manipulation:
+  - manipulation/
+  - common_interfaces/

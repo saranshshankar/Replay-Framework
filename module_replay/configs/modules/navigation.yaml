@@ -1,0 +1,15 @@
+name: navigation
+container: planner
+colcon_package: navigation_manager
+input_topics:
+  - /map/global_semantic
+  - /localization/pose
+  - /lidar_front/points
+  - /lidar_rear/points
+  - /tf
+  - /tf_static
+output_topics:
+  - /cmd_vel
+  - /navigation/plan
+launch:
+  command: "ros2 launch navigation_manager navigation.launch.py mode:=sim"

@@ -1,0 +1,21 @@
+name: lint-and-test
+# FRWK-01 scaffolding check: runs the unit suite on push + PR on a cheap runner.
+# No GPU, no ROS, no secrets. The trigger below is the safe PR event (it checks
+# out PR code WITHOUT the base repo's secrets) — never the secret-bearing
+# pull-request target variant, which would enable secret exfiltration (T-08-01).
+on:
+  push:
+    branches: [main]
+  pull_request:            # safe PR event only (no secret-bearing target variant)
+permissions:
+  contents: read           # read-only; this job has no secrets and no write scope
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    defaults: { run: { working-directory: module_replay } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev,metrics]"
+      - run: python -m pytest tests/ --ignore=tests/test_integration_smoke.py -q

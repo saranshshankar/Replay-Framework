@@ -12,14 +12,18 @@ from replay.data_manager import DataRef
 from replay.docker_utils import exec_in_container
 from replay.module_config import ModuleSpec
 
-# Seconds to wait after starting recorder + module so ROS 2 discovery settles
-# before we start playing the bag. Without this, the first messages of the bag
-# are published before the recorder has finished subscribing and are lost.
-DISCOVERY_WAIT_SECS = 3
-# Bigger read-ahead queue keeps `ros2 bag play` ahead of consumers when the
-# bag is dense (many high-rate camera + lidar topics). 1000 is comfortably
-# above the default and small enough not to balloon container memory.
-BAG_PLAY_READ_AHEAD_QUEUE = 1000
+# Read-ahead buffer for `ros2 bag play`. 5000 is the documented fix for the
+# observed ~3.9 s publish-interval stall gaps (RESEARCH § Pitfall 3): with the
+# default-sized queue, a dense bag (many high-rate camera + lidar topics) lets
+# the player fall behind its consumers and emit large publish gaps. 5000 keeps
+# the player comfortably ahead while staying within container memory.
+#
+# There is intentionally NO fixed discovery sleep: the old `sleep 3` was a
+# non-deterministic guess. It is replaced by a POST-LAUNCH readiness loop in
+# `_build_replay_script` that polls for the module's first output topic and
+# fails fast (exit 1) if the module never comes up — so a crashed launch is
+# visible to the CI gate instead of being masked.
+BAG_PLAY_READ_AHEAD_QUEUE = 5000
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,7 @@ def _build_replay_script(
     output_topics: list[str],
     launch_command: str,
     log_dir: Path,
+    qos_override_path: Optional[Path] = None,
 ) -> str:
     """Return a single bash script that records, launches, plays, and cleans up.
 
@@ -66,6 +71,20 @@ def _build_replay_script(
     """
     in_topics = " ".join(shlex.quote(t) for t in input_topics)
     out_topics = " ".join(shlex.quote(t) for t in output_topics)
+    # QoS override flag (RPLY-01): when a per-module qos yaml exists, pass it to
+    # `ros2 bag play` so /tf_static is republished with transient_local durability
+    # — perception needs the latched static TFs during its on_configure window.
+    # The path is package-relative and `.exists()`-guarded by the caller (never
+    # user-supplied), so no shell-quoting threat (T-02-01).
+    qos_flag = (
+        f" --qos-profile-overrides-path {qos_override_path}"
+        if qos_override_path is not None
+        else ""
+    )
+    # The readiness loop polls for the module's first output topic — it can only
+    # appear once the module is up, so it is the "module came up" gate that
+    # replaces the old fixed `sleep 3`.
+    first_output_topic = output_topics[0] if output_topics else ""
     # Each child runs under `setsid` so it gets its own process group; the
     # cleanup function then signals the entire group with `kill -<SIG> -PGID`
     # so descendants (e.g. perception_node spawned by `ros2 launch`) also
@@ -104,24 +123,40 @@ cleanup() {{
 }}
 trap cleanup EXIT INT TERM
 
-# Recorder first so it doesn't miss any module output.
-setsid ros2 bag record -o {output_bag} {out_topics} > {log_dir}/recorder.log 2>&1 &
+# Recorder first so it doesn't miss any module output. The MCAP storage flag
+# writes the newly recorded output bag as MCAP (SIGKILL-resilient + indexed
+# seeking) instead of the legacy sqlite3/.db3 default (CLAUDE.md: sqlite3
+# CHALLENGED; RESEARCH § Standard Stack). The offline faithfulness/metrics
+# reader (rosbags BagReader, plan 01-06) reads MCAP natively, so this is
+# transparent downstream.
+setsid ros2 bag record --storage mcap -o {output_bag} {out_topics} > {log_dir}/recorder.log 2>&1 &
 REC_PID=$!
 
-# Bag play second so /tf_static (transient_local) is on the bus BEFORE the
-# module's on_configure runs. Perception reads static TFs during configure;
-# if the module starts before play, those latched messages aren't available.
-# Trade-off: we lose the first few seconds of bag content while the module
-# is still coming up. Acceptable.
-setsid ros2 bag play {in_bag} --topics {in_topics} --clock --read-ahead-queue-size {BAG_PLAY_READ_AHEAD_QUEUE} &
+# Bag play second so the bag's latched /tf_static is on the bus during the
+# module's on_configure (the bag is the ONLY source of the *_corrected frames —
+# KT/playbooks/01-perception.md Step 4); the long-running player keeps it
+# latched. The player stays UNPAUSED-before-module: a paused player publishes
+# nothing, including /tf_static. The pause+preamble zero-loss variant is
+# deferred to the 8-phase runner (KT/SYSTEM-DESIGN-HLD-LLD.md B5/DD10).
+setsid ros2 bag play {in_bag} --topics {in_topics} --clock \\
+  --read-ahead-queue-size {BAG_PLAY_READ_AHEAD_QUEUE}{qos_flag} &
 PLAY_PID=$!
 
-sleep {DISCOVERY_WAIT_SECS}
-
-# Module last. By now the bag is publishing /tf_static, so the configure
+# Module launch. By now the bag is publishing /tf_static, so the configure
 # callback will see the latched messages.
 setsid {launch_command} > {log_dir}/module.log 2>&1 &
 MOD_PID=$!
+
+# Readiness: poll for the module's first output topic instead of a fixed sleep.
+# This can only succeed once the module is up, so it must run AFTER the launch.
+# Fails fast (exit 1) if the module never comes up - a crashed launch is then
+# visible to the CI gate instead of being masked.
+WAIT_MAX=30
+for i in $(seq 1 $WAIT_MAX); do
+  if ros2 topic list 2>/dev/null | grep -q "{first_output_topic}"; then break; fi
+  [ "$i" -eq "$WAIT_MAX" ] && echo "[runner] module readiness timeout" >&2 && exit 1
+  sleep 1
+done
 
 # Wait for play to finish (normal exit) or for a signal (trap fires).
 wait $PLAY_PID
@@ -160,6 +195,18 @@ def run_replay(
 
     output_bag = work_container / "replay_output"
 
+    # Resolve the per-module QoS override from the package configs dir the same
+    # way cli.py resolves configs. Guarded by .exists() so modules without a
+    # qos yaml simply run without the flag. NOTE: plan 01-03 adds
+    # `qos_override_path` to ModuleSpec — once it lands, prefer
+    # `module.qos_override_path` over this filesystem-derived lookup.
+    qos_override_path = (
+        Path(__file__).resolve().parent.parent
+        / "configs" / "qos" / f"{module.name}.yaml"
+    )
+    if not qos_override_path.exists():
+        qos_override_path = None
+
     script = _build_replay_script(
         in_bag=in_bag,
         output_bag=output_bag,
@@ -167,8 +214,9 @@ def run_replay(
         output_topics=module.output_topics,
         launch_command=module.launch_command,
         log_dir=work_container,
+        qos_override_path=qos_override_path,
     )
-    exec_in_container(container, script)
+    exit_code = exec_in_container(container, script)
 
     # Output bag is already on the host via bind mount; move it to output_dir.
     host_output = output_dir / "replay_output"
@@ -176,4 +224,4 @@ def run_replay(
         shutil.rmtree(host_output)
     shutil.move(str(work_host / "replay_output"), str(host_output))
 
-    return RunResult(output_bag_path=host_output, exit_code=0)
+    return RunResult(output_bag_path=host_output, exit_code=exit_code)

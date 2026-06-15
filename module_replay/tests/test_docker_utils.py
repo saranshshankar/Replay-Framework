@@ -57,19 +57,22 @@ def test_compose_up_detached():
 
 
 def test_exec_in_container_joins_command():
-    with patch("replay.docker_utils.run_cmd") as mock_run:
+    # exec_in_container now calls subprocess.run directly (not run_cmd) so a
+    # non-zero container exit returns the code instead of raising — assert the
+    # docker exec argv is still built the same way.
+    with patch("replay.docker_utils.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0)
         exec_in_container("v2-planner-docker-x86", "echo hello world")
-        mock_run.assert_called_once_with(
-            [
-                "docker",
-                "exec",
-                "-i",
-                "v2-planner-docker-x86",
-                "bash",
-                "-lc",
-                "echo hello world",
-            ]
-        )
+        args, _ = mock_run.call_args
+        assert args[0] == [
+            "docker",
+            "exec",
+            "-i",
+            "v2-planner-docker-x86",
+            "bash",
+            "-lc",
+            "echo hello world",
+        ]
 
 
 def test_compose_up_with_override():
@@ -95,3 +98,21 @@ def test_compose_up_with_pull_policy():
             "up", "-d",
             "--pull", "missing",
         ])
+
+
+def test_exec_in_container_returns_zero(mocker):
+    """FRWK-03: a clean replay (container exit 0) is reported as 0."""
+    m = mocker.patch("replay.docker_utils.subprocess.run")
+    m.return_value.returncode = 0
+    assert exec_in_container("c", "exit 0") == 0
+
+
+def test_exec_in_container_returns_nonzero_without_raising(mocker):
+    """FRWK-03: a crashed replay (container exit 1) is returned, NOT raised.
+
+    The caller (runner.py) propagates the code into RunResult so the CLI and
+    CI gate see the true outcome instead of a swallowed exit 0.
+    """
+    m = mocker.patch("replay.docker_utils.subprocess.run")
+    m.return_value.returncode = 1
+    assert exec_in_container("c", "exit 1") == 1  # must not raise

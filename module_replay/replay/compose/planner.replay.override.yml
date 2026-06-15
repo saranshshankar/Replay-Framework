@@ -2,11 +2,14 @@
 services:
   ros2_dev_v2:
     volumes:
-      - /home/bharat/workspace/src/module_replay/.replay_work:/root/ros2_ws/replay_work
+      # Host side of the work mount is machine-specific — setup_environment
+      # exports REPLAY_WORK_DIR from paths.HOST_REPLAY_WORKDIR before compose
+      # up. The :? form fails loudly instead of silently mounting a wrong path.
+      - ${REPLAY_WORK_DIR:?export REPLAY_WORK_DIR to the host module_replay/.replay_work path}:/root/ros2_ws/replay_work
       # Bag library mount (read-only) — runner plays bags directly from here
       # to skip the multi-GB copy into .replay_work. Override per-user via
-      # REPLAY_BAG_LIBRARY env var.
-      - ${REPLAY_BAG_LIBRARY:-/home/bharat/data}:/root/data:ro
+      # REPLAY_BAG_LIBRARY env var (default mirrors paths.HOST_BAG_LIBRARY).
+      - ${REPLAY_BAG_LIBRARY:-~/data}:/root/data:ro
     environment:
       # Pin a non-default domain to isolate replay traffic from anything else
       # on the host's domain 0 (the planner compose uses network_mode: host).

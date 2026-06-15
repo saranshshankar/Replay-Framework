@@ -3,20 +3,11 @@ from pathlib import Path
 import pytest
 
 from replay.data_manager import DataRef
-from replay.module_config import ModuleSpec
 from replay.runner import RunResult, run_replay
 
-
-@pytest.fixture
-def perception_spec() -> ModuleSpec:
-    return ModuleSpec(
-        name="perception",
-        container="planner",
-        colcon_package="realtime_perception",
-        input_topics=["/lidar_front/points", "/camera_0/image_raw/compressed"],
-        output_topics=["/perception/rgb", "/perception/depth"],
-        launch_command="ros2 launch realtime_perception perception.launch.py mode:=sim",
-    )
+# The shared ``perception_spec`` fixture now lives in tests/conftest.py and
+# resolves automatically. It was removed from this module to avoid duplication
+# (plan 01-01 Task 2).
 
 
 def test_run_replay_issues_single_shell_script(tmp_path: Path, perception_spec, mocker):

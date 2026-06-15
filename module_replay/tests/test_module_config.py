@@ -2,7 +2,53 @@ from pathlib import Path
 
 import pytest
 
-from replay.module_config import ModuleSpec, load_checkout_paths, load_module_config
+from replay.module_config import (
+    ModuleSpec,
+    ThresholdSpec,
+    load_checkout_paths,
+    load_module_config,
+    missing_preflight_assets,
+)
+
+
+# Minimal perception.yaml carrying the two-tier thresholds + qos_override block,
+# used by the threshold-parsing tests. Mirrors the real perception.yaml shape.
+_PERCEPTION_WITH_THRESHOLDS = """
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics:
+  - /perception_node/camera_0/image_raw
+output_topics:
+  - /perception_node/camera_0/image_raw_sim
+launch:
+  command: "ros2 launch realtime_perception perception_node.launch.py use_replay:=true"
+qos_override: configs/qos/perception.yaml
+thresholds:
+  validity:
+    replay_max_gap_ms:
+      max: 200
+      provisional: true
+  quality:
+    latency_p95_ms:
+      max: 50.0
+      tolerance_band: 5.0
+      provisional: true
+mocks: []
+"""
+
+# Minimal perception.yaml with NO thresholds block (back-compat case).
+_PERCEPTION_NO_THRESHOLDS = """
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics:
+  - /perception_node/camera_0/image_raw
+output_topics:
+  - /perception_node/camera_0/image_raw_sim
+launch:
+  command: "ros2 launch realtime_perception perception_node.launch.py use_replay:=true"
+"""
 
 
 @pytest.fixture
@@ -89,3 +135,65 @@ def test_load_checkout_paths_missing_file_raises(tmp_path: Path):
     d.mkdir()
     with pytest.raises(FileNotFoundError):
         load_checkout_paths("perception", d)
+
+
+def test_thresholds_loaded(tmp_path: Path):
+    """MTRC-06: validity + quality thresholds flatten into a typed ThresholdSpec dict."""
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_WITH_THRESHOLDS)
+    spec = load_module_config("perception", d)
+    assert isinstance(spec.thresholds["latency_p95_ms"], ThresholdSpec)
+    assert spec.thresholds["latency_p95_ms"].max == 50.0
+    assert spec.thresholds["latency_p95_ms"].provisional is True
+    assert spec.thresholds["latency_p95_ms"].tier == "quality"
+    assert spec.thresholds["replay_max_gap_ms"].tier == "validity"
+    assert spec.thresholds["replay_max_gap_ms"].max == 200
+    # qos_override + defaulted mocks/launch_args also land on the spec.
+    assert spec.qos_override_path == Path("configs/qos/perception.yaml")
+    assert spec.mocks == []
+    assert isinstance(spec.launch_args, dict)
+
+
+def test_config_without_thresholds_still_loads(tmp_path: Path):
+    """Back-compat: a minimal config with no thresholds block loads with thresholds == {}."""
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_NO_THRESHOLDS)
+    spec = load_module_config("perception", d)
+    assert spec.thresholds == {}
+    assert spec.qos_override_path is None
+    assert spec.mocks == []
+    assert spec.launch_args == {}
+    assert spec.preflight_assets == []
+
+
+def test_missing_preflight_assets_reports_only_missing(tmp_path: Path):
+    """B5 phase-0 fail-fast: the checker returns exactly the asset paths that don't exist."""
+    present = tmp_path / "present.trt"
+    present.write_text("x")
+    absent = tmp_path / "absent.trt"
+    spec = ModuleSpec(
+        name="perception",
+        container="planner",
+        colcon_package="realtime_perception",
+        input_topics=[],
+        output_topics=[],
+        launch_command="x",
+        preflight_assets=[str(present), str(absent)],
+    )
+    missing = missing_preflight_assets(spec)
+    assert missing == [str(absent)]
+
+
+def test_missing_preflight_assets_empty_when_no_block(tmp_path: Path):
+    """Back-compat: a spec with no preflight_assets returns []."""
+    spec = ModuleSpec(
+        name="perception",
+        container="planner",
+        colcon_package="realtime_perception",
+        input_topics=[],
+        output_topics=[],
+        launch_command="x",
+    )
+    assert missing_preflight_assets(spec) == []

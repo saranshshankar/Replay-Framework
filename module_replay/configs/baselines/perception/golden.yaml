@@ -1,0 +1,8 @@
+# Pinned-golden baseline manifest for perception (RESEARCH Gray Area 3).
+# S3 key schema is PROVISIONAL until platform team confirms Q-F.
+# CI compares against this golden; promotion is manual via replay-baseline-publish (Phase 2+).
+test_bag_id: perception_ci_v1
+baseline_sha: PROVISIONAL          # set on first manual publish
+s3_bucket: REPLAY_BASELINES_BUCKET # resolved from env/CI var at runtime
+s3_key: baselines/perception/perception_ci_v1/PROVISIONAL/
+provisional: true

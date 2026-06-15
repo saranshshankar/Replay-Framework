@@ -167,6 +167,35 @@ def test_build_replay_script_has_qos_override_flag(tmp_path: Path, perception_sp
     assert "--qos-profile-overrides-path" in script
 
 
+def test_run_replay_prefers_spec_qos_override_path(tmp_path: Path, mocker):
+    """Deferred 01-02/01-03 follow-up: when ModuleSpec carries an absolute
+    qos_override_path, the runner uses IT (not the filesystem-derived lookup)."""
+    import dataclasses
+
+    from replay.module_config import ModuleSpec
+
+    custom_qos = tmp_path / "custom_qos.yaml"
+    custom_qos.write_text("/tf_static:\n  durability: transient_local\n")
+    spec = ModuleSpec(
+        name="perception",
+        container="planner",
+        colcon_package="realtime_perception",
+        input_topics=["/in"],
+        output_topics=["/out"],
+        launch_command="ros2 launch x y.launch.py",
+        qos_override_path=custom_qos,
+    )
+    mocker.patch("replay.runner.paths.HOST_BAG_LIBRARY", tmp_path / "elsewhere")
+    data_ref = _staged_bag(tmp_path)
+    exec_mock = mocker.patch("replay.runner.exec_in_container", return_value=0)
+    mocker.patch("replay.runner.shutil.move")
+    mocker.patch("replay.runner.shutil.copytree")
+    run_replay(module=spec, data=data_ref, output_dir=tmp_path / "out")
+    _, script = exec_mock.call_args.args
+    assert str(custom_qos) in script
+    assert dataclasses.is_dataclass(spec)  # spec is the typed source of the path
+
+
 def test_build_replay_script_no_fixed_sleep(tmp_path: Path, perception_spec, mocker):
     """RPLY-04: no 'sleep 3'; readiness loop present; no --pause."""
     _, script = _run_and_capture_script(tmp_path, perception_spec, mocker)

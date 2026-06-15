@@ -195,15 +195,18 @@ def run_replay(
 
     output_bag = work_container / "replay_output"
 
-    # Resolve the per-module QoS override from the package configs dir the same
-    # way cli.py resolves configs. Guarded by .exists() so modules without a
-    # qos yaml simply run without the flag. NOTE: plan 01-03 adds
-    # `qos_override_path` to ModuleSpec — once it lands, prefer
-    # `module.qos_override_path` over this filesystem-derived lookup.
-    qos_override_path = (
-        Path(__file__).resolve().parent.parent
-        / "configs" / "qos" / f"{module.name}.yaml"
-    )
+    # Resolve the per-module QoS override. Prefer the typed `module.qos_override_path`
+    # (added to ModuleSpec in plan 01-03 — the deferred 01-02/01-03 follow-up); a
+    # relative value is resolved against the package root, mirroring how cli.py
+    # resolves configs. Fall back to the filesystem-derived lookup for specs that
+    # do not carry the field (e.g. the 6-field test fixtures). Guarded by .exists()
+    # so modules without a qos yaml simply run without the flag.
+    package_root = Path(__file__).resolve().parent.parent
+    if module.qos_override_path is not None:
+        spec_qos = Path(module.qos_override_path)
+        qos_override_path = spec_qos if spec_qos.is_absolute() else package_root / spec_qos
+    else:
+        qos_override_path = package_root / "configs" / "qos" / f"{module.name}.yaml"
     if not qos_override_path.exists():
         qos_override_path = None
 

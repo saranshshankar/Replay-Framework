@@ -19,10 +19,16 @@ from .latency import LatencyMetric
 from .pipeline import PipelineMetric
 from .segmentation import SegmentationMetric
 from .depth import DepthMetric
+from .overlap import OverlapMetric
+from .action_block import ActionBlockDriftMetric
+from .collision_box import CollisionBoxIoUMetric
 
 __all__ = [
     "LatencyMetric",
     "PipelineMetric",
     "SegmentationMetric",
     "DepthMetric",
+    "OverlapMetric",
+    "ActionBlockDriftMetric",
+    "CollisionBoxIoUMetric",
 ]

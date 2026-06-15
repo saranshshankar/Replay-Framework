@@ -1,0 +1,71 @@
+"""Replay-faithfulness validity-tier metric (RPLY-02 / RPLY-03).
+
+Faithfulness distinguishes infra-noise (a stalled/dropping replay) from a real
+quality regression. It is the VALIDITY tier: if ``max_gap_ms`` (or the drop rate)
+exceeds the module's validity threshold, the replay is invalid and the run's
+quality metrics are not trusted -- the gate fails on validity, not quality.
+
+This metric is offline, pure-Python numpy compute over already-loaded timestamps
+(no I/O, no deserialization here -- the BagReader did that). It imports rosbags
+only transitively (via BagReader); nothing here touches the ROS runtime client.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from replay.metrics.base import BaseMetric
+
+
+# NOTE: deliberately NOT @register_metric("perception") -- the CLI/report layer invokes this
+# class explicitly as the validity tier (plan 01-07). Registering it would (a) make the
+# perception pack count 8 and break 01-05's seven-plugin test in full-suite runs, and
+# (b) run faithfulness a second time as a quality-row metric.
+class ReplayFaithfulnessMetric(BaseMetric):
+    name = "replay_faithfulness"
+    requires_baseline = False
+    tier = "validity"   # validity-tier: a breach invalidates the run
+
+    def compute(self, reader, config: dict) -> dict:
+        topics = config.get("output_topics") or config.get("input_topics") or []
+        expected_hz = float(config.get("expected_hz", 10.0))
+        expected_period_ms = 1000.0 / expected_hz
+        # Denominator guard (C1: one starved camera zeroes ALL outputs -- that collapse must
+        # BREACH validity, never pass vacuously): expectations use the OVERALL bag span, so
+        # an empty/near-empty topic contributes its full expected count as drops.
+        all_ts = [t for topic in topics for t, _ in reader.get_messages(topic)]
+        span_s = ((max(all_ts) - min(all_ts)) / 1e9) if len(all_ts) >= 2 else 0.0
+        if span_s == 0.0:
+            # Nothing (or a single message) in the whole output bag: maximally invalid.
+            return {"max_gap_ms": 1e9, "breach_count": len(topics), "drop_rate": 1.0,
+                    "per_topic": {t: {"max_gap_ms": 1e9, "breach_count": 1, "count": 0} for t in topics},
+                    "empty_topics": list(topics), "tier": "validity"}
+        expected_per_topic = max(int(round(span_s * expected_hz)), 1)
+        per_topic, empty_topics = {}, []
+        worst_gap, total_breaches, total_actual = 0.0, 0, 0
+        for topic in topics:
+            ts = np.array([t for t, _ in reader.get_messages(topic)], dtype=float)
+            if ts.size < 2:
+                # empty/singleton topic over a non-trivial span = a validity breach, not a free pass
+                per_topic[topic] = {"max_gap_ms": 1e9, "breach_count": 1, "count": int(ts.size)}
+                empty_topics.append(topic)
+                worst_gap = max(worst_gap, 1e9)
+                total_breaches += 1
+                total_actual += int(ts.size)
+                continue
+            intervals_ms = np.diff(np.sort(ts)) / 1e6
+            max_gap = float(np.max(intervals_ms))
+            breaches = int(np.sum(intervals_ms > 2 * expected_period_ms))
+            per_topic[topic] = {"max_gap_ms": max_gap, "breach_count": breaches, "count": int(ts.size)}
+            worst_gap = max(worst_gap, max_gap)
+            total_breaches += breaches
+            total_actual += int(ts.size)
+        total_expected = expected_per_topic * len(topics)
+        drop_rate = ((total_expected - total_actual) / total_expected) if total_expected else 0.0
+        return {
+            "max_gap_ms": worst_gap,
+            "breach_count": total_breaches,
+            "drop_rate": float(min(max(drop_rate, 0.0), 1.0)),
+            "per_topic": per_topic,
+            "empty_topics": empty_topics,
+            "tier": "validity",
+        }

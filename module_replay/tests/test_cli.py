@@ -290,3 +290,32 @@ launch:
     )
     assert result.exit_code == 0, result.output
     run_mock.assert_called_once()
+
+
+def test_all_cmd_propagates_nonzero_exit(tmp_path: Path, mocker):
+    """FRWK-03 / B9: a non-zero replay exit maps to process exit 3.
+
+    Codes 1 and 2 are reserved for the metrics verdict; any replay/setup
+    failure maps to 3 with the container code echoed for diagnosis.
+    """
+    from replay.cli import main
+    from replay.runner import RunResult
+
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    mocker.patch("replay.cli.setup_environment")
+    mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=bag, exit_code=137),
+    )
+    r = CliRunner().invoke(
+        main,
+        [
+            "all",
+            "--module", "perception",
+            "--local-bag", str(bag),
+            "--output", str(tmp_path / "out"),
+        ],
+    )
+    assert r.exit_code == 3, r.output   # B9: replay failures map to 3

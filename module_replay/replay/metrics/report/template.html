@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>{{ doc.module }} replay report</title></head>
+<body>
+<h1>{{ doc.module }} — {{ doc.verdict }}</h1>
+<p>run: {{ doc.run_id }} · pass: {{ doc.pass }}</p>
+{% if doc.details %}<p>{{ doc.details }}</p>{% endif %}
+{% if doc.replay_faithfulness %}
+<h2>Replay faithfulness ({{ doc.replay_faithfulness.verdict }})</h2>
+<p>max_gap_ms={{ doc.replay_faithfulness.max_gap_ms }}
+   breach_count={{ doc.replay_faithfulness.breach_count }}
+   drop_rate={{ doc.replay_faithfulness.drop_rate }}</p>
+{% endif %}
+<table border="1">
+<tr><th>metric</th><th>value</th><th>passed</th><th>tier</th><th>provisional</th><th>note</th></tr>
+{% for m in doc.metrics %}
+<tr><td>{{ m.name }}</td><td>{{ m.value }}</td><td>{{ m.passed }}</td><td>{{ m.tier }}</td><td>{{ m.provisional }}</td><td>{{ m.note if m.note else "" }}</td></tr>
+{% endfor %}
+</table>
+</body>
+</html>

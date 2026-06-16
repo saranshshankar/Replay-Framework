@@ -65,6 +65,10 @@ def generate_report(
     # Key map: a "replay_"-prefixed threshold name maps onto the faithfulness
     # field with that prefix stripped (replay_max_gap_ms -> max_gap_ms,
     # replay_drop_rate -> drop_rate); a non-prefixed name is matched verbatim.
+    # ``rows`` is the report's visible record; the validity else-branch below
+    # appends to it, so it must be initialized BEFORE the validity loop (the
+    # quality loop then continues appending to the same list).
+    rows = []
     validity_pass = True
     faith_block = None
     if faithfulness is not None:
@@ -76,6 +80,25 @@ def generate_report(
                 validity_pass = validity_pass and evaluate_threshold(
                     float(faithfulness[fkey]), vt
                 )
+            else:
+                # WR-03 / T-07-02: a validity threshold that cannot be evaluated
+                # must NOT pass silently. Validity is the stronger gate (exit 2) —
+                # fail closed and surface it visibly, mirroring the quality tier's
+                # no-silent-pass guard.
+                validity_pass = False
+                rows.append(
+                    {
+                        "name": tname,
+                        "value": None,
+                        "passed": None,
+                        "tier": "validity",
+                        "provisional": getattr(vt, "provisional", True),
+                        "note": (
+                            f"validity threshold has no matching faithfulness "
+                            f"field '{fkey}' — failing closed"
+                        ),
+                    }
+                )
         faith_block = {
             **faithfulness,
             "verdict": "pass" if validity_pass else "fail",
@@ -83,7 +106,8 @@ def generate_report(
         }
 
     # ── Quality tier (AND-gate) ─────────────────────────────────────────────
-    rows = []
+    # ``rows`` was initialized before the validity loop (it may already hold a
+    # failed-closed validity row); the quality loop continues appending to it.
     quality_pass = True
     for r in metric_results:
         spec = thresholds.get(r.name)

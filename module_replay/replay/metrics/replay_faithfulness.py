@@ -30,23 +30,41 @@ class ReplayFaithfulnessMetric(BaseMetric):
         """Coerce cfg['expected_hz'] (a per-topic dict OR a bare scalar) to one float.
 
         A dict resolves to its 'default' entry (fallback 10.0); a scalar passes
-        through. Keeps this metric from crashing on the 01-10 dict shape while the
-        per-topic logic lands in 01-12.
+        through. Retained as the back-compat seam: ``_expected_hz_for`` reuses the
+        same dict|scalar tolerance, and callers passing a bare float still work.
         """
         if isinstance(expected_hz, dict):
             return float(expected_hz.get("default", 10.0))
         return float(expected_hz)
 
+    @staticmethod
+    def _expected_hz_for(topic: str, expected_hz) -> float:
+        """Return the expected publish rate (Hz) for ``topic``.
+
+        ``expected_hz`` is the 01-10 substring->Hz map (e.g.
+        ``{"default": 10.0, "diagnostics": 0.2}``) OR a bare scalar (back-compat).
+        For the dict form, the first key (other than "default") that is a SUBSTRING
+        of the topic wins — so "diagnostics" matches "/perception_node/diagnostics"
+        at 0.2 Hz, while every camera falls through to "default" (10 Hz). This is the
+        gap-1 fix: the 0.2 Hz diagnostics topic is no longer scanned at a flat 10 Hz.
+        """
+        if not isinstance(expected_hz, dict):
+            return float(expected_hz)
+        for key, hz in expected_hz.items():
+            if key == "default":
+                continue
+            if key in topic:
+                return float(hz)
+        return float(expected_hz.get("default", 10.0))
+
     def compute(self, reader, config: dict) -> dict:
         topics = config.get("output_topics") or config.get("input_topics") or []
         # 01-10 threads a per-topic map (e.g. {"default": 10.0, "diagnostics": 0.2})
-        # into cfg["expected_hz"]; older callers/tests pass a bare scalar. Accept both
-        # here so the threaded dict does not crash the pipeline. NOTE: this resolves a
-        # single representative rate (the map's "default") — true per-topic-rate
-        # faithfulness (diagnostics at 0.2 Hz, cross-camera equal-count, stamp dedup)
-        # is plan 01-12's job. This is the non-crashing foundation it builds on.
-        expected_hz = self._resolve_default_hz(config.get("expected_hz", 10.0))
-        expected_period_ms = 1000.0 / expected_hz
+        # into cfg["expected_hz"]; older callers/tests pass a bare scalar. Both shapes
+        # flow through _expected_hz_for, which resolves the rate PER TOPIC (substring
+        # match, "default" fallback). This is the UAT-gap-1 fix: diagnostics at 0.2 Hz
+        # gets a 10000 ms breach threshold and a span*0.2 expected count, not a flat 10 Hz.
+        expected_hz_map = config.get("expected_hz", 10.0)
         # Denominator guard (C1: one starved camera zeroes ALL outputs -- that collapse must
         # BREACH validity, never pass vacuously): expectations use the OVERALL bag span, so
         # an empty/near-empty topic contributes its full expected count as drops.
@@ -57,10 +75,15 @@ class ReplayFaithfulnessMetric(BaseMetric):
             return {"max_gap_ms": 1e9, "breach_count": len(topics), "drop_rate": 1.0,
                     "per_topic": {t: {"max_gap_ms": 1e9, "breach_count": 1, "count": 0} for t in topics},
                     "empty_topics": list(topics), "tier": "validity"}
-        expected_per_topic = max(int(round(span_s * expected_hz)), 1)
         per_topic, empty_topics = {}, []
-        worst_gap, total_breaches, total_actual = 0.0, 0, 0
+        worst_gap, total_breaches = 0.0, 0
+        total_actual, total_expected = 0, 0
         for topic in topics:
+            # PER-TOPIC rate: cameras 10 Hz (default), diagnostics 0.2 Hz, etc.
+            hz = self._expected_hz_for(topic, expected_hz_map)
+            expected_period_ms = 1000.0 / hz
+            expected_per_topic = max(int(round(span_s * hz)), 1)
+            total_expected += expected_per_topic
             ts = np.array([t for t, _ in reader.get_messages(topic)], dtype=float)
             if ts.size < 2:
                 # empty/singleton topic over a non-trivial span = a validity breach, not a free pass
@@ -72,12 +95,13 @@ class ReplayFaithfulnessMetric(BaseMetric):
                 continue
             intervals_ms = np.diff(np.sort(ts)) / 1e6
             max_gap = float(np.max(intervals_ms))
+            # breach threshold is PER-TOPIC: 2 * this topic's nominal period
+            # (diagnostics at 0.2 Hz => 10000 ms, not the cameras' 200 ms).
             breaches = int(np.sum(intervals_ms > 2 * expected_period_ms))
             per_topic[topic] = {"max_gap_ms": max_gap, "breach_count": breaches, "count": int(ts.size)}
             worst_gap = max(worst_gap, max_gap)
             total_breaches += breaches
             total_actual += int(ts.size)
-        total_expected = expected_per_topic * len(topics)
         drop_rate = ((total_expected - total_actual) / total_expected) if total_expected else 0.0
         return {
             "max_gap_ms": worst_gap,

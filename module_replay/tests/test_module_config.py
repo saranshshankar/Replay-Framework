@@ -50,6 +50,29 @@ launch:
   command: "ros2 launch realtime_perception perception_node.launch.py use_replay:=true"
 """
 
+# Minimal perception.yaml carrying the new metric-config block (01-10): per-topic
+# expected_hz, depth_topics, diagnostics_topic. These thread into the metric cfg so
+# faithfulness/depth/latency stop falling back to broken flat-10Hz/all-topics defaults.
+_PERCEPTION_WITH_METRIC_CFG = """
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics:
+  - /perception_node/camera_0/image_raw
+output_topics:
+  - /perception_node/camera_0/image_raw_sim
+  - /perception_node/camera_0/depth_raw_sim
+  - /perception_node/diagnostics
+launch:
+  command: "ros2 launch realtime_perception perception_node.launch.py use_replay:=true"
+expected_hz:
+  default: 10.0
+  diagnostics: 0.2
+depth_topics:
+  - /perception_node/camera_0/depth_raw_sim
+diagnostics_topic: /perception_node/diagnostics
+"""
+
 
 @pytest.fixture
 def configs_dir(tmp_path: Path) -> Path:
@@ -166,6 +189,66 @@ def test_config_without_thresholds_still_loads(tmp_path: Path):
     assert spec.mocks == []
     assert spec.launch_args == {}
     assert spec.preflight_assets == []
+
+
+def test_expected_hz_parses_into_dict(tmp_path: Path):
+    """01-10 / UAT gap 1: the `expected_hz:` block parses into a dict[str, float].
+
+    Faithfulness reads this per-topic map so the 0.2 Hz diagnostics topic is no
+    longer scanned against a flat 10 Hz (which breached the 200ms gate every run).
+    """
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_WITH_METRIC_CFG)
+    spec = load_module_config("perception", d)
+    assert spec.expected_hz == {"default": 10.0, "diagnostics": 0.2}
+    assert isinstance(spec.expected_hz["default"], float)
+
+
+def test_depth_topics_parses_into_list(tmp_path: Path):
+    """01-10 / UAT gap 5: `depth_topics:` parses into a list DepthMetric scans."""
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_WITH_METRIC_CFG)
+    spec = load_module_config("perception", d)
+    assert spec.depth_topics == ["/perception_node/camera_0/depth_raw_sim"]
+
+
+def test_diagnostics_topic_parses_into_str(tmp_path: Path):
+    """01-10: `diagnostics_topic:` parses into a str LatencyMetric will read."""
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_WITH_METRIC_CFG)
+    spec = load_module_config("perception", d)
+    assert spec.diagnostics_topic == "/perception_node/diagnostics"
+
+
+def test_metric_cfg_fields_default_when_absent(tmp_path: Path):
+    """Back-compat: a config with no metric-cfg block defaults expected_hz={},
+    depth_topics=[], diagnostics_topic=None."""
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_NO_THRESHOLDS)
+    spec = load_module_config("perception", d)
+    assert spec.expected_hz == {}
+    assert spec.depth_topics == []
+    assert spec.diagnostics_topic is None
+
+
+def test_six_field_modulespec_defaults_metric_cfg():
+    """The 6-field conftest fixture (and runner callers) construct ModuleSpec with
+    only the required fields; the new metric-cfg fields MUST all be defaulted."""
+    spec = ModuleSpec(
+        name="perception",
+        container="planner",
+        colcon_package="realtime_perception",
+        input_topics=[],
+        output_topics=[],
+        launch_command="x",
+    )
+    assert spec.expected_hz == {}
+    assert spec.depth_topics == []
+    assert spec.diagnostics_topic is None
 
 
 def test_missing_preflight_assets_reports_only_missing(tmp_path: Path):

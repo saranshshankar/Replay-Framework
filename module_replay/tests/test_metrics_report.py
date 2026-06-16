@@ -98,6 +98,23 @@ def test_uncomputed_threshold_skipped(tmp_path):
     assert skipped and skipped[0]["passed"] is None and "skipped" in skipped[0]["note"]
 
 
+def test_breach_count_gate_invalidates(tmp_path):
+    """01-12 residual: a per-topic stall (breach_count>=1) on ANY topic must invalidate via
+    the replay_breach_count validity gate (max 0) — the rate-aware signal 01-12 built is now
+    a gated field, even when the headline max_gap_ms is clean."""
+    th = {
+        "replay_max_gap_ms": ThresholdSpec(max=200.0, tier="validity"),
+        "replay_breach_count": ThresholdSpec(max=0, tier="validity"),
+    }
+    rc = generate_report(
+        "perception", "t", [], tmp_path, th,
+        faithfulness={"max_gap_ms": 100.0, "breach_count": 1, "drop_rate": 0.0},
+    )
+    assert rc == 2
+    doc = json.loads((tmp_path / "metrics.json").read_text())
+    assert doc["verdict"] == "INVALID"
+
+
 def test_report_html_written(tmp_path):
     th = {"latency_p95_ms": ThresholdSpec(max=50.0, tier="quality")}
     generate_report("perception", "t", [_mr("latency_p95_ms", 10.0)], tmp_path, th)

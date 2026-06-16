@@ -5,6 +5,8 @@ import pytest
 
 from replay.metrics.bag_reader import BagReader
 from replay.metrics.replay_faithfulness import ReplayFaithfulnessMetric
+from replay.metrics.report.generator import generate_report
+from replay.module_config import ThresholdSpec, load_module_config
 
 IN = "/perception_node/camera_0/image_raw"
 
@@ -187,3 +189,59 @@ def test_faithfulness_cross_camera_equal_counts_not_flagged(tmp_path):
     out = ReplayFaithfulnessMetric().compute(reader, {"output_topics": SEM, "expected_hz": 10.0})
     assert out["cross_camera_count_mismatch"] is False, out
     assert out["breach_count"] == 0
+
+
+# --- 01-12 residual (UAT gap 1, validity-VERDICT half): the headline max_gap_ms gate ---
+# 01-12 fixed per-topic breach_count, but the TOP-LEVEL max_gap_ms (the field
+# replay_max_gap_ms gates on) still carried diagnostics' legit 5000ms gap -> healthy
+# runs false-INVALIDed (exit 2) through the real generator. These tests pin the verdict path.
+
+
+def test_faithfulness_headline_max_gap_excludes_slow_topics(tmp_path):
+    """The TOP-LEVEL max_gap_ms (gated by replay_max_gap_ms at 200ms) must reflect
+    uniform-rate topics only — NOT the 0.2Hz diagnostics topic's legitimate ~5000ms
+    interval. The diagnostics gap stays recorded per-topic (visibility preserved)."""
+    bag = _write_bag(
+        tmp_path / "headline",
+        {CAM: _hz_stamps(10.0, span_s=10.0), DIAG: _hz_stamps(0.2, span_s=10.0)},
+    )
+    reader = BagReader(bag, [CAM, DIAG])
+    out = ReplayFaithfulnessMetric().compute(
+        reader, {"output_topics": [CAM, DIAG], "expected_hz": {"default": 10.0, "diagnostics": 0.2}},
+    )
+    assert out["max_gap_ms"] <= 200.0, out["max_gap_ms"]
+    assert 4900.0 <= out["per_topic"][DIAG]["max_gap_ms"] <= 5100.0
+
+
+def test_healthy_mixed_rate_run_validates_through_generator(tmp_path):
+    """The assertion the original gap-1 test was MISSING: a healthy mixed-rate bag's
+    faithfulness result, run through the REAL generator with the real validity thresholds,
+    must be VALID (exit 0) — not INVALID. Previously the headline max_gap_ms carried
+    diagnostics' 5000ms gap and tripped replay_max_gap_ms (200) -> exit 2."""
+    bag = _write_bag(
+        tmp_path / "verdict",
+        {CAM: _hz_stamps(10.0, span_s=10.0), DIAG: _hz_stamps(0.2, span_s=10.0)},
+    )
+    reader = BagReader(bag, [CAM, DIAG])
+    faith = ReplayFaithfulnessMetric().compute(
+        reader, {"output_topics": [CAM, DIAG], "expected_hz": {"default": 10.0, "diagnostics": 0.2}},
+    )
+    th = {
+        "replay_max_gap_ms": ThresholdSpec(max=200.0, tier="validity"),
+        "replay_drop_rate": ThresholdSpec(max=0.02, tier="validity"),
+        "replay_breach_count": ThresholdSpec(max=0, tier="validity"),
+    }
+    rc = generate_report("perception", "t", [], tmp_path, th, faithfulness=faith)
+    assert rc == 0, faith
+
+
+def test_perception_config_gates_breach_count():
+    """The rate-aware per-topic breach signal (01-12) must actually be GATED. perception.yaml
+    must carry a replay_breach_count validity threshold (max 0) so a per-topic stall on ANY
+    topic (incl diagnostics, now excluded from the headline max_gap_ms) still invalidates."""
+    configs = Path(__file__).resolve().parent.parent / "configs" / "modules"
+    spec = load_module_config("perception", configs)
+    assert "replay_breach_count" in spec.thresholds, list(spec.thresholds)
+    bc = spec.thresholds["replay_breach_count"]
+    assert bc.tier == "validity"
+    assert bc.max == 0

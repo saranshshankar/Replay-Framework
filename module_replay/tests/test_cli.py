@@ -465,6 +465,151 @@ def test_build_metrics_cfg_threads_new_keys():
     assert cfg["diagnostics_topic"] == "/perception_node/diagnostics"
 
 
+def _semantic_bag(bag_dir: Path, frames):
+    """Write a tiny rgba8 semantic_raw_sim bag (R channel = class id) for the
+    baseline-wiring CLI tests. ``frames`` is a list of (H, W) class-id arrays."""
+    import numpy as np
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    topic = "/perception_node/camera_0/semantic_raw_sim"
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    Image = typestore.types["sensor_msgs/msg/Image"]
+    Header = typestore.types["std_msgs/msg/Header"]
+    Time = typestore.types["builtin_interfaces/msg/Time"]
+    with Writer(bag_dir, version=Writer.VERSION_LATEST) as writer:
+        conn = writer.add_connection(topic, Image.__msgtype__, typestore=typestore)
+        for i, classid in enumerate(frames):
+            classid = np.asarray(classid, dtype=np.uint8)
+            h, w = classid.shape
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[..., 0] = classid
+            ts = i * 100_000_000
+            hdr = Header(
+                stamp=Time(sec=int(ts // 1_000_000_000), nanosec=int(ts % 1_000_000_000)),
+                frame_id="cam0",
+            )
+            msg = Image(header=hdr, height=h, width=w, encoding="rgba8",
+                        is_bigendian=0, step=w * 4, data=rgba.reshape(-1))
+            writer.write(conn, ts, typestore.serialize_cdr(msg, Image.__msgtype__))
+    return bag_dir
+
+
+def _baseline_configs(tmp_path: Path) -> Path:
+    """A configs dir whose perception.yaml carries ONLY the semantic topic + the
+    mask_iou_vs_golden min-0.98 threshold, so the baseline-wiring tests gate purely
+    on mask_iou (no diagnostics/depth machinery needed)."""
+    configs = tmp_path / "configs" / "modules"
+    configs.mkdir(parents=True)
+    (configs / "perception.yaml").write_text(
+        """
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics: []
+output_topics:
+  - /perception_node/camera_0/semantic_raw_sim
+launch:
+  command: "x"
+thresholds:
+  quality:
+    mask_iou_vs_golden:
+      min: 0.98
+      provisional: true
+"""
+    )
+    return configs.parent
+
+
+def test_metrics_baseline_invokes_compare(tmp_path: Path):
+    """01-15 / UAT gap 2: `metrics --baseline <bag>` resolves the baseline, builds a
+    baseline BagReader, and invokes MaskIoUVsGoldenMetric.compare — metrics.json has
+    a numeric mask_iou_vs_golden row (NOT a 'skipped' row)."""
+    import json
+    import numpy as np
+
+    frame = np.zeros((16, 16), dtype=np.uint8)
+    frame[:8, :] = 1
+    cand = _semantic_bag(tmp_path / "cand", [frame, frame])
+    base = _semantic_bag(tmp_path / "base", [frame, frame])
+    configs = _baseline_configs(tmp_path)
+
+    out = tmp_path / "out"
+    r = CliRunner().invoke(
+        main,
+        ["metrics", "--module", "perception", "--bag", str(cand),
+         "--baseline", str(base), "--output", str(out), "--configs-dir", str(configs)],
+    )
+    assert r.exit_code == 0, r.output
+    doc = json.loads((out / "reports" / "metrics.json").read_text())
+    rows = {m["name"]: m for m in doc["metrics"]}
+    assert "mask_iou_vs_golden" in rows
+    row = rows["mask_iou_vs_golden"]
+    # A real comparison ran: numeric value, evaluated against the threshold (passed
+    # is a bool), NOT a skipped/None row.
+    assert isinstance(row["value"], (int, float)) and row["value"] is not None, row
+    assert row["passed"] is True
+    assert row["value"] == 1.0  # identical candidate==baseline
+
+
+def test_metrics_without_baseline_is_visible_skip_not_silent_pass(tmp_path: Path):
+    """01-15: WITHOUT --baseline, mask_iou_vs_golden is a VISIBLE skipped row
+    (passed: None) — never a silent pass, never a false fail. The run can still PASS
+    on its intrinsic gates (here there are none, so verdict is PASS)."""
+    import json
+    import numpy as np
+
+    frame = np.zeros((16, 16), dtype=np.uint8)
+    frame[:8, :] = 1
+    cand = _semantic_bag(tmp_path / "cand", [frame, frame])
+    configs = _baseline_configs(tmp_path)
+
+    out = tmp_path / "out"
+    r = CliRunner().invoke(
+        main,
+        ["metrics", "--module", "perception", "--bag", str(cand),
+         "--output", str(out), "--configs-dir", str(configs)],
+    )
+    # No baseline -> regression metric must NOT silently fail the gate. Verdict PASS.
+    assert r.exit_code == 0, r.output
+    doc = json.loads((out / "reports" / "metrics.json").read_text())
+    rows = {m["name"]: m for m in doc["metrics"]}
+    assert "mask_iou_vs_golden" in rows
+    row = rows["mask_iou_vs_golden"]
+    assert row["passed"] is None          # visible skip, neither pass nor fail
+    assert row["value"] is None
+    # Must NOT have a numeric value that would have gated as a pass.
+    assert doc["pass"] is True
+
+
+def test_metrics_baseline_fails_closed_on_empty_comparison(tmp_path: Path):
+    """01-15 / FAIL-CLOSED: --baseline with ZERO comparable frames must NOT green-light
+    the regression metric. The mask_iou_vs_golden row must not be a passing scalar."""
+    import json
+    import numpy as np
+
+    frame = np.zeros((16, 16), dtype=np.uint8)
+    frame[:8, :] = 1
+    cand = _semantic_bag(tmp_path / "cand", [frame])
+    base = _semantic_bag(tmp_path / "base", [])  # empty baseline -> no comparable frames
+    configs = _baseline_configs(tmp_path)
+
+    out = tmp_path / "out"
+    r = CliRunner().invoke(
+        main,
+        ["metrics", "--module", "perception", "--bag", str(cand),
+         "--baseline", str(base), "--output", str(out), "--configs-dir", str(configs)],
+    )
+    doc = json.loads((out / "reports" / "metrics.json").read_text())
+    rows = {m["name"]: m for m in doc["metrics"]}
+    assert "mask_iou_vs_golden" in rows
+    row = rows["mask_iou_vs_golden"]
+    # NOT a false 1.0 / passing scalar. A None scalar (visible no-scalar row) is the
+    # fail-closed signal: passed must not be True, and there is no green scalar.
+    assert row["passed"] is not True, row
+    assert row["value"] is None, row
+
+
 def test_run_viz_states_deferred(tmp_path: Path, mocker):
     """01-10 / UAT gap 7: --run-viz states viz is deferred to a later phase
     (scope-honest), NOT the old 'not implemented yet' no-op echo."""

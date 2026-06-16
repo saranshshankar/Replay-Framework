@@ -60,13 +60,22 @@ class SegmentationMetric(BaseMetric):
 
     def compute(self, reader: BagReader, config: dict) -> dict:
         output_topics = config.get("output_topics", [])
+        # Gap 8: restrict to the semantic-mask topics. Temporal consistency is a
+        # FRAME-TO-FRAME quantity within one camera stream, so decoding rgb/depth
+        # frames here (or pairing across two different topics) is meaningless.
+        # Fall back to all output topics only if no semantic topic is present (the
+        # tiny synthetic fixture), preserving the graceful-degradation contract.
+        semantic_topics = [t for t in output_topics if "semantic_raw_sim" in t]
+        topics = semantic_topics or output_topics
 
         coverage_per_class = {f"class_{c}": [] for c in range(NUM_CLASSES)}
         agreements: list[float] = []
         num_frames = 0
-        prev: Optional[np.ndarray] = None
 
-        for topic in output_topics:
+        for topic in topics:
+            # Reset prev at each topic boundary so frame-to-frame consistency never
+            # bleeds across topics (a camera_0 frame is never paired with camera_1).
+            prev: Optional[np.ndarray] = None
             for _ts, msg in reader.get_messages(topic):
                 mask = _decode_mask(msg)
                 if mask is None:

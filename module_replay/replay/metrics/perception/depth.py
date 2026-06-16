@@ -26,6 +26,17 @@ from replay.metrics.bag_reader import BagReader
 from replay.metrics.registry import register_metric
 
 
+def _is_depth_encoding(encoding: str) -> bool:
+    """True for float/uint depth encodings (32FC*, 16UC*, mono16) — NOT rgb/rgba.
+
+    The gap-5 fix: when ``depth_topics`` is not configured, the metric must
+    self-filter by encoding so it never decodes an rgb8/rgba8 colour frame as
+    float32 depth (which produced garbage depth stats over the wrong topics).
+    """
+    enc = str(encoding or "")
+    return enc.startswith("32FC") or enc.startswith("16UC") or enc == "mono16"
+
+
 def _decode_depth(msg: Any) -> Optional[np.ndarray]:
     """Decode a depth Image-like message to a flat float array of depth values.
 
@@ -66,7 +77,22 @@ class DepthMetric(BaseMetric):
     requires_baseline = False
 
     def compute(self, reader: BagReader, config: dict) -> dict:
-        topics = config.get("depth_topics") or config.get("output_topics", [])
+        # Gap 5: scope to the configured depth topics; if none are configured fall
+        # back to output topics whose name carries the depth_raw_sim substring, and
+        # only if THAT is also empty do we scan all output topics — but in that last
+        # case self-filter each frame by depth encoding (32FC*/16UC*) so an rgb8 /
+        # rgba8 colour frame is never decoded as float32 depth.
+        depth_topics = config.get("depth_topics")
+        output_topics = config.get("output_topics", [])
+        if depth_topics:
+            topics = depth_topics
+            enforce_encoding = False
+        else:
+            named = [t for t in output_topics if "depth_raw_sim" in t]
+            topics = named or output_topics
+            # When we had to fall back to all output topics, the topic name no
+            # longer guarantees depth — filter by encoding inside the loop.
+            enforce_encoding = not named
 
         valid_fractions: list[float] = []
         means: list[float] = []
@@ -74,6 +100,8 @@ class DepthMetric(BaseMetric):
 
         for topic in topics:
             for _ts, msg in reader.get_messages(topic):
+                if enforce_encoding and not _is_depth_encoding(getattr(msg, "encoding", "")):
+                    continue
                 depth = _decode_depth(msg)
                 if depth is None:
                     continue

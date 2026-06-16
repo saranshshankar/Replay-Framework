@@ -26,6 +26,14 @@ class PipelineMetric(BaseMetric):
 
     def compute(self, reader: BagReader, config: dict) -> dict:
         output_topics = config.get("output_topics", [])
+        # Gap 8: the headline mean_hz must NOT average the 0.2 Hz diagnostics topic
+        # in with the ~10 Hz camera output topics. Exclude the configured
+        # diagnostics topic and any topic carrying the "diagnostics" substring from
+        # the aggregate pool (the per-topic detail still lists every topic).
+        diag_topic = config.get("diagnostics_topic")
+
+        def _is_diagnostics(topic: str) -> bool:
+            return topic == diag_topic or "diagnostics" in topic
 
         per_topic: dict[str, dict] = {}
         for topic in output_topics:
@@ -49,7 +57,13 @@ class PipelineMetric(BaseMetric):
                 "mean_interval_ms": round(mean_interval_ms, 3),
             }
 
-        hz_values = [v["mean_hz"] for v in per_topic.values() if v["num_messages"] >= 2]
+        # mean_hz aggregate excludes diagnostics-rate topics (gap 8) so a 0.2 Hz
+        # topic no longer drags the throughput headline.
+        hz_values = [
+            v["mean_hz"]
+            for topic, v in per_topic.items()
+            if v["num_messages"] >= 2 and not _is_diagnostics(topic)
+        ]
         return {
             "per_topic": per_topic,
             "mean_hz": round(float(np.mean(hz_values)), 3) if hz_values else 0.0,

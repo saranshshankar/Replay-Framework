@@ -142,3 +142,48 @@ def test_faithfulness_per_topic_rate_scalar_backcompat(tmp_path):
     out = ReplayFaithfulnessMetric().compute(reader, {"output_topics": [CAM], "expected_hz": 10.0})
     assert out["breach_count"] == 0
     assert 90.0 <= out["max_gap_ms"] <= 110.0
+
+
+# --- 01-12 Task 2: structural validity checks (contract §5 / verification finding #8) ---
+
+SEM = [f"/perception_node/camera_{i}/semantic_raw_sim" for i in range(6)]
+
+
+def test_faithfulness_unique_stamp_dedup(tmp_path):
+    """Contract §5 / finding #8: getLatest() is non-consuming and can re-emit a stamp,
+    so counting must be over UNIQUE stamps. A topic with 10 messages but only 5 distinct
+    stamps must report unique_count == 5 (not 10)."""
+    period = 100_000_000  # 100 ms
+    # 5 distinct stamps, each emitted twice (10 messages, 5 unique) -- simulates re-emit
+    stamps = [period * (i // 2) for i in range(10)]
+    assert len(stamps) == 10 and len(set(stamps)) == 5
+    bag = _write_bag(tmp_path / "dup", {CAM: stamps})
+    reader = BagReader(bag, [CAM])
+    out = ReplayFaithfulnessMetric().compute(reader, {"output_topics": [CAM], "expected_hz": 10.0})
+    assert out["per_topic"][CAM]["unique_count"] == 5, out["per_topic"][CAM]
+    assert out["per_topic"][CAM]["count"] == 10  # raw count preserved for visibility
+
+
+def test_faithfulness_cross_camera_count_mismatch_flagged(tmp_path):
+    """Contract §5: TimeSync emits complete 6-sets only, so unequal semantic-camera counts
+    are a red flag. compute() must surface cross_camera_count_mismatch=True when one camera
+    has materially fewer frames than its peers."""
+    topic_stamps = {t: _hz_stamps(10.0, span_s=5.0) for t in SEM}
+    # starve camera 3: keep only the first 10 of ~51 frames
+    topic_stamps[SEM[3]] = topic_stamps[SEM[3]][:10]
+    bag = _write_bag(tmp_path / "mismatch", topic_stamps)
+    reader = BagReader(bag, SEM)
+    out = ReplayFaithfulnessMetric().compute(reader, {"output_topics": SEM, "expected_hz": 10.0})
+    assert out["cross_camera_count_mismatch"] is True, out
+    # the offending per-camera counts must be visible in the output
+    assert "cross_camera_counts" in out
+
+
+def test_faithfulness_cross_camera_equal_counts_not_flagged(tmp_path):
+    """Equal counts across the 6 semantic cameras must NOT flag the mismatch."""
+    topic_stamps = {t: _hz_stamps(10.0, span_s=5.0) for t in SEM}
+    bag = _write_bag(tmp_path / "equal", topic_stamps)
+    reader = BagReader(bag, SEM)
+    out = ReplayFaithfulnessMetric().compute(reader, {"output_topics": SEM, "expected_hz": 10.0})
+    assert out["cross_camera_count_mismatch"] is False, out
+    assert out["breach_count"] == 0

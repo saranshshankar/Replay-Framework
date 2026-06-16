@@ -3,6 +3,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from replay.cli import main
+from replay.module_config import ModuleSpec
 
 
 def test_cli_help_lists_subcommands():
@@ -434,3 +435,60 @@ def test_metrics_subcommand_offline_produces_report(tmp_path: Path, synthetic_ba
     doc = json.loads(metrics_json.read_text())
     assert doc["module"] == "perception"
     assert "pass" in doc and "verdict" in doc
+
+
+def test_build_metrics_cfg_threads_new_keys():
+    """01-10 / UAT gaps 1+5: _build_metrics_cfg threads the per-topic expected_hz
+    map, depth_topics, and diagnostics_topic from the ModuleSpec into the cfg dict.
+
+    Downstream plans read these keys: 01-12 (faithfulness) reads expected_hz, 01-13
+    DepthMetric reads depth_topics, 01-13 LatencyMetric reads diagnostics_topic.
+    """
+    from replay.cli import _build_metrics_cfg
+
+    spec = ModuleSpec(
+        name="perception",
+        container="planner",
+        colcon_package="realtime_perception",
+        input_topics=["/perception_node/camera_0/image_raw"],
+        output_topics=["/perception_node/camera_0/depth_raw_sim", "/perception_node/diagnostics"],
+        launch_command="x",
+        expected_hz={"default": 10.0, "diagnostics": 0.2},
+        depth_topics=["/perception_node/camera_0/depth_raw_sim"],
+        diagnostics_topic="/perception_node/diagnostics",
+    )
+    cfg = _build_metrics_cfg(spec)
+    assert cfg["input_topics"] == spec.input_topics
+    assert cfg["output_topics"] == spec.output_topics
+    assert cfg["expected_hz"] == {"default": 10.0, "diagnostics": 0.2}
+    assert cfg["depth_topics"] == ["/perception_node/camera_0/depth_raw_sim"]
+    assert cfg["diagnostics_topic"] == "/perception_node/diagnostics"
+
+
+def test_run_viz_states_deferred(tmp_path: Path, mocker):
+    """01-10 / UAT gap 7: --run-viz states viz is deferred to a later phase
+    (scope-honest), NOT the old 'not implemented yet' no-op echo."""
+    from replay.runner import RunResult
+
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    mocker.patch("replay.cli.setup_environment")
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[])
+    mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=bag, exit_code=0),
+    )
+    r = CliRunner().invoke(
+        main,
+        [
+            "all",
+            "--module", "perception",
+            "--local-bag", str(bag),
+            "--output", str(tmp_path / "out"),
+            "--run-viz",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert "deferred" in r.output
+    assert "not implemented yet" not in r.output

@@ -241,26 +241,173 @@ def test_overlap_defaults_to_akaze(synthetic_bag):
     json.dumps(out)
 
 
-def test_regression_metrics_compare(synthetic_bag):
-    """MTRC-02: the 2 regression metrics implement compare() returning drift/IoU dicts."""
-    from replay.metrics.perception.action_block import ActionBlockDriftMetric
-    from replay.metrics.perception.collision_box import CollisionBoxIoUMetric
-
-    candidate = BagReader(synthetic_bag, [IN, OUT])
-    baseline = BagReader(synthetic_bag, [IN, OUT])
-
-    drift = ActionBlockDriftMetric().compare(candidate, baseline, CFG)
-    assert "mean_drift_mm" in drift and "max_drift_mm" in drift
-    json.dumps(drift)
-
-    iou = CollisionBoxIoUMetric().compare(candidate, baseline, CFG)
-    assert "mean_iou" in iou and "min_iou" in iou
-    json.dumps(iou)
+# ── mask_iou_vs_golden: perception's ONE regression metric (01-15 / UAT gap 2) ──
+# semantic_raw_sim is rgba8 with the class id in the R channel (contract §2). The
+# helper below writes a baseline + candidate semantic bag where the candidate's
+# class regions can be shifted, so a per-class IoU drop is provable. We keep the
+# bags tiny but >= MIN region size so the IoU math is non-degenerate.
+SEM_TOPIC = "/perception_node/camera_0/semantic_raw_sim"
 
 
-def test_all_seven_plugins_registered():
-    """MOD-01: importing the pack registers all 7 perception plugins."""
+def _write_semantic_bag(bag_dir, frames, topic=SEM_TOPIC):
+    """Write a rosbag2 dir of rgba8 semantic Image frames.
+
+    ``frames`` is a list of (H, W) int class-id arrays; the R channel carries the
+    class id (G/B/A zeroed) — exactly the contract §2 semantic_raw_sim layout. The
+    header stamp is the frame index * 100ms so candidate and baseline join by stamp.
+    """
+    import numpy as _np
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    Image = typestore.types["sensor_msgs/msg/Image"]
+    Header = typestore.types["std_msgs/msg/Header"]
+    Time = typestore.types["builtin_interfaces/msg/Time"]
+
+    with Writer(bag_dir, version=Writer.VERSION_LATEST) as writer:
+        conn = writer.add_connection(topic, Image.__msgtype__, typestore=typestore)
+        for i, classid in enumerate(frames):
+            classid = _np.asarray(classid, dtype=_np.uint8)
+            h, w = classid.shape
+            rgba = _np.zeros((h, w, 4), dtype=_np.uint8)
+            rgba[..., 0] = classid  # R channel = class id
+            ts = i * 100_000_000
+            hdr = Header(
+                stamp=Time(sec=int(ts // 1_000_000_000), nanosec=int(ts % 1_000_000_000)),
+                frame_id="cam0",
+            )
+            msg = Image(
+                header=hdr, height=h, width=w, encoding="rgba8",
+                is_bigendian=0, step=w * 4, data=rgba.reshape(-1),
+            )
+            writer.write(conn, ts, typestore.serialize_cdr(msg, Image.__msgtype__))
+    return topic
+
+
+def _mask_iou_cfg():
+    return {"output_topics": [SEM_TOPIC]}
+
+
+def test_mask_iou_identical_is_one(tmp_path):
+    """Identical candidate==baseline semantic frames -> mask_iou_vs_golden == 1.0,
+    a top-level scalar in [0,1]."""
+    from replay.metrics.perception.mask_iou import MaskIoUVsGoldenMetric
+
+    import numpy as _np
+    frame = _np.zeros((8, 8), dtype=_np.uint8)
+    frame[:4, :] = 1  # class 1 occupies the top half; class 0 the bottom
+    _write_semantic_bag(tmp_path / "cand", [frame, frame])
+    _write_semantic_bag(tmp_path / "base", [frame, frame])
+
+    cand = BagReader(tmp_path / "cand", [SEM_TOPIC])
+    base = BagReader(tmp_path / "base", [SEM_TOPIC])
+    out = MaskIoUVsGoldenMetric().compare(cand, base, _mask_iou_cfg())
+    json.dumps(out)
+    assert "mask_iou_vs_golden" in out
+    assert 0.0 <= out["mask_iou_vs_golden"] <= 1.0
+    assert out["mask_iou_vs_golden"] == 1.0
+    assert out["num_frames"] > 0  # frames actually matched (not a vacuous 1.0)
+
+
+def test_mask_iou_shifted_region_drops_below_one(tmp_path):
+    """A candidate where one class region is shifted -> per-class mean IoU < 1.0
+    but > 0 (boundary changes are real, not noise)."""
+    from replay.metrics.perception.mask_iou import MaskIoUVsGoldenMetric
+
+    import numpy as _np
+    base_frame = _np.zeros((8, 8), dtype=_np.uint8)
+    base_frame[:4, :] = 1                  # class 1 = top 4 rows
+    cand_frame = _np.zeros((8, 8), dtype=_np.uint8)
+    cand_frame[:6, :] = 1                  # class 1 region grown to top 6 rows (shifted boundary)
+
+    _write_semantic_bag(tmp_path / "cand", [cand_frame])
+    _write_semantic_bag(tmp_path / "base", [base_frame])
+    cand = BagReader(tmp_path / "cand", [SEM_TOPIC])
+    base = BagReader(tmp_path / "base", [SEM_TOPIC])
+    out = MaskIoUVsGoldenMetric().compare(cand, base, _mask_iou_cfg())
+    json.dumps(out)
+    assert 0.0 < out["mask_iou_vs_golden"] < 1.0
+
+
+def test_mask_iou_gate_enforces_end_to_end(tmp_path):
+    """Wired through generate_report with min 0.98: a matching golden (IoU ~0.99)
+    PASSES (exit 0), a regressed golden (IoU ~0.90) FAILS the gate (exit 1)."""
+    from replay.metrics.perception.mask_iou import MaskIoUVsGoldenMetric
+    from replay.metrics.base import MetricResult
+    from replay.module_config import ThresholdSpec
+    from replay.metrics.report.generator import generate_report
+
+    import numpy as _np
+    th = {"mask_iou_vs_golden": ThresholdSpec(min=0.98, tolerance_band=0.0, tier="quality")}
+
+    def _run(cand_frame, base_frame, name):
+        _write_semantic_bag(tmp_path / f"{name}_c", [cand_frame])
+        _write_semantic_bag(tmp_path / f"{name}_b", [base_frame])
+        cand = BagReader(tmp_path / f"{name}_c", [SEM_TOPIC])
+        base = BagReader(tmp_path / f"{name}_b", [SEM_TOPIC])
+        val = MaskIoUVsGoldenMetric().compare(cand, base, _mask_iou_cfg())
+        mr = MetricResult(name="mask_iou_vs_golden", module="perception",
+                          value=val, passed=False, is_regression=True)
+        return generate_report("perception", "t", [mr], tmp_path / name, th), val["mask_iou_vs_golden"]
+
+    # A 100x100 frame: flipping ~100 of 10000 pixels in one class region -> IoU ~0.99 -> PASS.
+    base100 = _np.zeros((100, 100), dtype=_np.uint8)
+    base100[:50, :] = 1
+    pass_cand = base100.copy()
+    pass_cand[50, :] = 1  # one extra row in class 1 -> tiny boundary flip -> IoU ~0.99
+    rc_pass, iou_pass = _run(pass_cand, base100, "pass_run")
+    assert iou_pass >= 0.98, iou_pass
+    assert rc_pass == 0
+
+    # Shift the boundary 10 rows -> region change -> IoU well below 0.98 -> FAIL exit 1.
+    fail_cand = _np.zeros((100, 100), dtype=_np.uint8)
+    fail_cand[:60, :] = 1
+    rc_fail, iou_fail = _run(fail_cand, base100, "fail_run")
+    assert iou_fail < 0.98, iou_fail
+    assert rc_fail == 1
+
+
+def test_mask_iou_empty_comparison_is_not_a_passing_scalar(tmp_path):
+    """FAIL-CLOSED: zero comparable frames (mis-aligned/empty baseline) must NOT
+    yield a passing 1.0 scalar that green-lights the gate."""
+    from replay.metrics.perception.mask_iou import MaskIoUVsGoldenMetric
+
+    import numpy as _np
+    frame = _np.zeros((8, 8), dtype=_np.uint8)
+    frame[:4, :] = 1
+    # Candidate has frames; baseline bag has the topic but ZERO messages -> no joins.
+    _write_semantic_bag(tmp_path / "cand", [frame])
+    _write_semantic_bag(tmp_path / "base", [])  # empty -> no comparable frames
+    cand = BagReader(tmp_path / "cand", [SEM_TOPIC])
+    base = BagReader(tmp_path / "base", [SEM_TOPIC])
+    out = MaskIoUVsGoldenMetric().compare(cand, base, _mask_iou_cfg())
+    json.dumps(out)
+    assert out["num_frames"] == 0
+    # The scalar must be None (or otherwise non-passing), never a false 1.0.
+    assert out["mask_iou_vs_golden"] is None
+
+
+def test_action_block_and_collision_box_deleted():
+    """01-15 / UAT decision_locked: action_block + collision_box are removed from
+    perception entirely (out-of-scope 3D/service outputs)."""
+    import pytest
+
+    with pytest.raises(ModuleNotFoundError):
+        import replay.metrics.perception.action_block  # noqa: F401
+    with pytest.raises(ModuleNotFoundError):
+        import replay.metrics.perception.collision_box  # noqa: F401
+
+
+def test_all_perception_plugins_registered():
+    """MOD-01: importing the pack registers exactly 6 perception plugins (5 intrinsic
+    + mask_iou_vs_golden). action_block + collision_box were dropped (01-15)."""
     import replay.metrics.perception  # noqa: F401  (triggers registration)
     from replay.metrics.registry import get_metric_plugins
 
-    assert len(get_metric_plugins("perception")) == 7
+    plugins = get_metric_plugins("perception")
+    assert len(plugins) == 6
+    names = {p.name for p in plugins}
+    assert "mask_iou_vs_golden" in names
+    assert "action_block_center_drift_mm" not in names
+    assert "collision_box_iou" not in names

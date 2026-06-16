@@ -46,6 +46,24 @@ launch:
 
 qos_override: configs/qos/perception.yaml
 
+# Per-topic expected publish rate (substring match; default applies to cameras at 10 Hz,
+# diagnostics is 0.2 Hz — report_interval_sec:5.0, contract §2). Faithfulness uses this so
+# the 0.2 Hz diagnostics topic is no longer scanned against a flat 10 Hz (UAT gap 1).
+expected_hz:
+  default: 10.0
+  diagnostics: 0.2
+# The 6 depth output topics DepthMetric scans (32FC4); without this it falls back to ALL
+# output topics and decodes rgb/semantic as depth (UAT gap 5).
+depth_topics:
+  - /perception_node/camera_0/depth_raw_sim
+  - /perception_node/camera_1/depth_raw_sim
+  - /perception_node/camera_2/depth_raw_sim
+  - /perception_node/camera_3/depth_raw_sim
+  - /perception_node/camera_4/depth_raw_sim
+  - /perception_node/camera_5/depth_raw_sim
+# The diagnostics topic LatencyMetric parses for seg_argmax compute time (contract §5).
+diagnostics_topic: /perception_node/diagnostics
+
 thresholds:
   validity:
     replay_max_gap_ms:

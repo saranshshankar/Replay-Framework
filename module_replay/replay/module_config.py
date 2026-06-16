@@ -42,6 +42,11 @@ class ModuleSpec:
     mocks: list = field(default_factory=list)        # Phase 3+ mock node specs
     launch_args: dict = field(default_factory=dict)  # extra "key:=value" launch pairs
     preflight_assets: list = field(default_factory=list)  # host paths checked fail-fast
+    # Metric-config block (01-10): threaded into the metric cfg by cli so plugins
+    # stop falling back to broken defaults (flat-10Hz / all-output-topics).
+    expected_hz: dict = field(default_factory=dict)  # topic-substring -> expected publish Hz
+    depth_topics: list = field(default_factory=list)  # depth output topics for DepthMetric
+    diagnostics_topic: Optional[str] = None           # perception diagnostics topic for LatencyMetric
 
 
 def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
@@ -80,6 +85,12 @@ def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
     mocks = data.get("mocks") or []
     preflight_assets = list(data.get("preflight_assets") or [])
 
+    # Metric-config block (01-10): per-topic expected_hz map, depth topic list, and
+    # the diagnostics topic. All optional (defaulted) so 6-field callers are unaffected.
+    expected_hz = data.get("expected_hz") or {}
+    depth_topics = list(data.get("depth_topics") or [])
+    diagnostics_topic = data.get("diagnostics_topic")
+
     return ModuleSpec(
         name=data["name"],
         container=container,
@@ -92,6 +103,9 @@ def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
         mocks=mocks,
         launch_args=launch_args,
         preflight_assets=preflight_assets,
+        expected_hz=expected_hz,
+        depth_topics=depth_topics,
+        diagnostics_topic=diagnostics_topic,
     )
 
 

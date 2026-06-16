@@ -103,6 +103,133 @@ def test_intrinsic_metrics_json_serializable(synthetic_bag):
         json.dumps(cls().compute(reader, CFG))  # no exception
 
 
+def _write_image_bag(bag_dir, topic_specs):
+    """Write a rosbag2 dir of Image messages from ``topic_specs``.
+
+    Each spec: (topic, encoding, height, width, channels, count, period_ns).
+    Returns the list of topics written. Used by the topic-scoping RED tests so a
+    single bag can carry e.g. a 32FC4 depth topic + an rgb8 topic + a 0.2 Hz
+    diagnostics-rate camera topic.
+    """
+    import numpy as _np
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    Image = typestore.types["sensor_msgs/msg/Image"]
+    Header = typestore.types["std_msgs/msg/Header"]
+    Time = typestore.types["builtin_interfaces/msg/Time"]
+
+    topics = []
+    with Writer(bag_dir, version=Writer.VERSION_LATEST) as writer:
+        for topic, encoding, h, w, ch, count, period in topic_specs:
+            conn = writer.add_connection(topic, Image.__msgtype__, typestore=typestore)
+            topics.append(topic)
+            bytes_per = 4 if encoding.startswith("32FC") else (2 if encoding.startswith("16UC") else 1)
+            nbytes = h * w * ch * bytes_per
+            for i in range(count):
+                ts = i * period
+                hdr = Header(
+                    stamp=Time(sec=int(ts // 1_000_000_000), nanosec=int(ts % 1_000_000_000)),
+                    frame_id="cam",
+                )
+                if encoding.startswith("32FC"):
+                    # Valid finite positive depths so depth_validity is meaningful.
+                    payload = _np.full(h * w * ch, 2.5, dtype=_np.float32).view(_np.uint8)
+                else:
+                    payload = _np.zeros(nbytes, dtype=_np.uint8)
+                msg = Image(
+                    header=hdr, height=h, width=w, encoding=encoding,
+                    is_bigendian=0, step=w * ch * bytes_per, data=payload,
+                )
+                writer.write(conn, ts, typestore.serialize_cdr(msg, Image.__msgtype__))
+    return topics
+
+
+DEPTH0 = "/perception_node/camera_0/depth_raw_sim"
+RGB0 = "/perception_node/camera_0/image_raw_sim"
+SEM0 = "/perception_node/camera_0/semantic_raw_sim"
+SEM1 = "/perception_node/camera_1/semantic_raw_sim"
+
+
+def test_depth_scoped_to_depth_topics(tmp_path):
+    """Gap 5: DepthMetric scans ONLY cfg['depth_topics'] — never rgb/semantic frames.
+
+    A bag with 4 depth (32FC4) frames + 6 rgb8 frames: num_frames must equal the
+    depth frame count (4), not depth+rgb (10), when depth_topics names only depth."""
+    from replay.metrics.perception.depth import DepthMetric
+
+    bag = tmp_path / "depthscope"
+    _write_image_bag(bag, [
+        (DEPTH0, "32FC4", 4, 4, 4, 4, 100_000_000),
+        (RGB0, "rgb8", 4, 4, 3, 6, 100_000_000),
+    ])
+    reader = BagReader(bag, [DEPTH0, RGB0])
+    cfg = {"output_topics": [DEPTH0, RGB0], "depth_topics": [DEPTH0]}
+    out = DepthMetric().compute(reader, cfg)
+    json.dumps(out)
+    assert out["num_frames"] == 4  # only depth frames, not depth+rgb
+
+
+def test_depth_self_filters_by_encoding_when_no_depth_topics(tmp_path):
+    """Gap 5 fallback: with depth_topics empty, depth self-filters by 32FC encoding
+    rather than decoding every rgb8 frame as float32 depth."""
+    from replay.metrics.perception.depth import DepthMetric
+
+    bag = tmp_path / "depthencfilter"
+    _write_image_bag(bag, [
+        (DEPTH0, "32FC4", 4, 4, 4, 3, 100_000_000),
+        (RGB0, "rgb8", 4, 4, 3, 5, 100_000_000),
+    ])
+    reader = BagReader(bag, [DEPTH0, RGB0])
+    # No depth_topics AND no depth_raw_sim in output -> must self-filter by encoding.
+    cfg = {"output_topics": [DEPTH0, RGB0], "depth_topics": []}
+    out = DepthMetric().compute(reader, cfg)
+    json.dumps(out)
+    assert out["num_frames"] == 3  # only the 32FC4 frames decoded as depth
+
+
+def test_pipeline_mean_hz_excludes_diagnostics(tmp_path):
+    """Gap 8: pipeline mean_hz must NOT average the 0.2 Hz diagnostics topic in with
+    the 10 Hz camera topics. Per-topic detail may list it; the headline mean excludes it."""
+    from replay.metrics.perception.pipeline import PipelineMetric
+
+    DIAG_TOPIC = "/perception_node/diagnostics"
+    bag = tmp_path / "pipescope"
+    _write_image_bag(bag, [
+        (RGB0, "rgb8", 2, 2, 3, 10, 100_000_000),       # 10 Hz
+        (DIAG_TOPIC, "rgb8", 2, 2, 3, 4, 5_000_000_000),  # 0.2 Hz (stand-in)
+    ])
+    reader = BagReader(bag, [RGB0, DIAG_TOPIC])
+    cfg = {"output_topics": [RGB0, DIAG_TOPIC], "diagnostics_topic": DIAG_TOPIC}
+    out = PipelineMetric().compute(reader, cfg)
+    json.dumps(out)
+    # The 10 Hz camera mean must not be dragged toward ~5 Hz by the 0.2 Hz topic.
+    assert out["mean_hz"] > 5.0
+    assert abs(out["mean_hz"] - 10.0) < 0.5
+
+
+def test_segmentation_no_cross_topic_prev_bleed(tmp_path):
+    """Gap 8: SegmentationMetric resets prev at each topic boundary, so scanning two
+    different semantic topics never produces a cross-topic consistency pair."""
+    from replay.metrics.perception.segmentation import SegmentationMetric
+
+    bag = tmp_path / "segscope"
+    # Two semantic topics, ONE frame each: within-topic there are zero consistency
+    # pairs; a cross-topic bleed would wrongly pair the two single frames.
+    _write_image_bag(bag, [
+        (SEM0, "rgba8", 4, 4, 4, 1, 100_000_000),
+        (SEM1, "rgba8", 4, 4, 4, 1, 100_000_000),
+    ])
+    reader = BagReader(bag, [SEM0, SEM1])
+    cfg = {"output_topics": [SEM0, SEM1]}
+    out = SegmentationMetric().compute(reader, cfg)
+    json.dumps(out)
+    assert out["num_frames"] == 2
+    # No within-topic pair (1 frame each) and NO cross-topic pair (prev reset).
+    assert out["num_consistency_pairs"] == 0
+
+
 def test_overlap_defaults_to_akaze(synthetic_bag):
     """Decision/MTRC-02: overlap uses AKAZE, not lightglue/torch."""
     from replay.metrics.perception.overlap import OverlapMetric

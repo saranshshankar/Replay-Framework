@@ -29,3 +29,23 @@ def test_faithfulness_empty_topic_breaches(synthetic_bag):
     assert missing in out["empty_topics"]
     assert out["breach_count"] >= 1
     assert out["drop_rate"] > 0.02   # breaches the replay_drop_rate validity threshold
+
+
+def test_faithfulness_accepts_expected_hz_dict(synthetic_bag):
+    """01-10 foundation: cfg['expected_hz'] is now a per-topic dict (from
+    _build_metrics_cfg). compute() must accept the dict shape without crashing,
+    resolving the 'default' rate. (True per-topic-rate logic lands in 01-12.)"""
+    reader = BagReader(synthetic_bag, [IN])
+    out = ReplayFaithfulnessMetric().compute(
+        reader, {"output_topics": [IN], "expected_hz": {"default": 10.0, "diagnostics": 0.2}}
+    )
+    # Same result as the scalar-10.0 path: the 'default' entry resolves to 10 Hz.
+    assert out["breach_count"] == 0
+    assert 90.0 <= out["max_gap_ms"] <= 110.0
+
+
+def test_resolve_default_hz_handles_both_shapes():
+    """The coercion helper accepts a dict (-> 'default') or a bare scalar."""
+    assert ReplayFaithfulnessMetric._resolve_default_hz({"default": 10.0, "diagnostics": 0.2}) == 10.0
+    assert ReplayFaithfulnessMetric._resolve_default_hz({}) == 10.0  # empty dict -> 10.0 fallback
+    assert ReplayFaithfulnessMetric._resolve_default_hz(7.5) == 7.5

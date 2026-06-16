@@ -25,6 +25,24 @@ DEFAULT_VERSION_YAML_NAME = "default.yaml"
 _VERDICT_LABELS = {0: "PASS", 1: "FAIL", 2: "INVALID RUN"}
 
 
+def _build_metrics_cfg(module_spec) -> dict:
+    """Build the cfg dict every metric plugin receives (WR-02 config threading).
+
+    Carries not just the topic lists but the per-topic expected_hz map, the depth
+    output topics, and the diagnostics topic — so faithfulness (01-12), DepthMetric
+    (01-13) and LatencyMetric (01-13) stop falling back to broken defaults
+    (flat-10Hz / all-output-topics / no-diagnostics). Kept as a tiny pure function
+    so it is unit-testable without a bag.
+    """
+    return {
+        "input_topics": module_spec.input_topics,
+        "output_topics": module_spec.output_topics,
+        "expected_hz": module_spec.expected_hz,        # per-topic map (01-12 reads it)
+        "depth_topics": module_spec.depth_topics,      # 01-13 DepthMetric reads it
+        "diagnostics_topic": module_spec.diagnostics_topic,  # 01-13 LatencyMetric reads it
+    }
+
+
 def _run_metrics_pipeline(module_spec, bag_path: Path, output_dir: Path) -> int:
     """Run the registered perception plugins + faithfulness over an output bag,
     generate the report, and return the B9 exit code.
@@ -41,10 +59,7 @@ def _run_metrics_pipeline(module_spec, bag_path: Path, output_dir: Path) -> int:
 
     topics = list(module_spec.input_topics) + list(module_spec.output_topics)
     reader = BagReader(bag_path, topics)
-    cfg = {
-        "input_topics": module_spec.input_topics,
-        "output_topics": module_spec.output_topics,
-    }
+    cfg = _build_metrics_cfg(module_spec)
 
     # Validity tier: faithfulness is invoked EXPLICITLY (it is deliberately not
     # registered as a quality plugin — 01-06), so it gates as the validity tier.
@@ -222,7 +237,7 @@ def run(module: str, bag_path: Path, output_dir: Path, configs_dir: Path) -> Non
     help="Cap colcon parallel-workers and MAKEFLAGS -j to N processes. Default 2 - drop to 1 if the laptop still stalls.",
 )
 @click.option("--run-metrics", is_flag=True, default=False)
-@click.option("--run-viz", is_flag=True, default=False)
+@click.option("--run-viz", is_flag=True, default=False, help="(deferred — no-op in Phase 1)")
 def all_cmd(
     module: str,
     task_id: Optional[str],
@@ -291,7 +306,13 @@ def all_cmd(
         if rc != 0:
             sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
     if run_viz:
-        click.echo("Viz requested - not implemented yet.")  # viz wiring deferred to MOD-01 e2e
+        # Scope-honest deferral (UAT gap 7): SC1 advertises --run-viz, but the
+        # CI gate reads metrics.json (not images), so the developer visualizations
+        # are deferred to a later phase rather than shipped as a silent no-op.
+        click.echo(
+            "--run-viz: visualization is deferred to a later phase "
+            "(the CI gate reads metrics.json, not images)."
+        )
 
 
 @main.command("metrics")

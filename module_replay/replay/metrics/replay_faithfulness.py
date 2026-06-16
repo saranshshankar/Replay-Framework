@@ -25,9 +25,27 @@ class ReplayFaithfulnessMetric(BaseMetric):
     requires_baseline = False
     tier = "validity"   # validity-tier: a breach invalidates the run
 
+    @staticmethod
+    def _resolve_default_hz(expected_hz) -> float:
+        """Coerce cfg['expected_hz'] (a per-topic dict OR a bare scalar) to one float.
+
+        A dict resolves to its 'default' entry (fallback 10.0); a scalar passes
+        through. Keeps this metric from crashing on the 01-10 dict shape while the
+        per-topic logic lands in 01-12.
+        """
+        if isinstance(expected_hz, dict):
+            return float(expected_hz.get("default", 10.0))
+        return float(expected_hz)
+
     def compute(self, reader, config: dict) -> dict:
         topics = config.get("output_topics") or config.get("input_topics") or []
-        expected_hz = float(config.get("expected_hz", 10.0))
+        # 01-10 threads a per-topic map (e.g. {"default": 10.0, "diagnostics": 0.2})
+        # into cfg["expected_hz"]; older callers/tests pass a bare scalar. Accept both
+        # here so the threaded dict does not crash the pipeline. NOTE: this resolves a
+        # single representative rate (the map's "default") — true per-topic-rate
+        # faithfulness (diagnostics at 0.2 Hz, cross-camera equal-count, stamp dedup)
+        # is plan 01-12's job. This is the non-crashing foundation it builds on.
+        expected_hz = self._resolve_default_hz(config.get("expected_hz", 10.0))
         expected_period_ms = 1000.0 / expected_hz
         # Denominator guard (C1: one starved camera zeroes ALL outputs -- that collapse must
         # BREACH validity, never pass vacuously): expectations use the OVERALL bag span, so

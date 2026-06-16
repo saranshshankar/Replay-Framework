@@ -81,9 +81,16 @@ thresholds:
       min: 0.75
       tolerance_band: 0.03
       provisional: true
-    # mask_iou_vs_golden is C1's primary comparison (pinned-golden; FP16 => never
-    # bit-exact). The evaluator (01-07) reports it "skipped" with a warning while
-    # no golden fixture exists yet (01-06 starts warning-only until curated bags land).
+    # mask_iou_vs_golden is C1's primary (and only) perception regression metric —
+    # per-frame semantic-mask IoU vs a pinned golden (pinned-golden; FP16 => never
+    # bit-exact). Wired end-to-end via `--baseline` (plan 01-15): with a baseline it
+    # gates here; without one the evaluator (01-07) reports a visible "skipped"
+    # warning row (warning-only until curated golden bags land, 01-06).
+    # NOTE: action_block_center_drift_mm + collision_box_iou were DROPPED (01-15 /
+    # UAT decision_locked) — they were 2D pixel proxies of out-of-scope 3D/service
+    # outputs (PoseStamped / 3D-OBB MarkerArray from action_block_segmentation) on
+    # topics not in this list. They belong to a future action-block module that
+    # replays that service node, not perception's feed-forward replay.
     mask_iou_vs_golden:
       min: 0.98
       provisional: true

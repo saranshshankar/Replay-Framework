@@ -43,14 +43,54 @@ def _build_metrics_cfg(module_spec) -> dict:
     }
 
 
-def _run_metrics_pipeline(module_spec, bag_path: Path, output_dir: Path) -> int:
+def _resolve_baseline_bag(
+    baseline: Optional[Path], module_spec, configs_dir: Path
+) -> Optional[Path]:
+    """Resolve a ``--baseline`` value to a readable baseline bag path.
+
+    Two paths (MTRC-04, plan 01-15):
+    - a local rosbag2 directory passed directly as ``--baseline <path>`` (the cheap
+      CI/dev path — no S3, the curated golden is already on disk); used verbatim.
+    - any other value is treated as the pinned-golden STRATEGY: resolve via
+      ``BaselineManager(configs_dir).resolve(module)``, which reads the committed
+      golden.yaml manifest and fetches the golden bag from S3.
+
+    Returns None when ``baseline`` is None (no baseline requested).
+    """
+    if baseline is None:
+        return None
+    if Path(baseline).exists():
+        return Path(baseline)
+    from replay.metrics.baseline import BaselineManager
+
+    ref = BaselineManager(configs_dir).resolve(module_spec.name)
+    return ref.bag_path
+
+
+def _run_metrics_pipeline(
+    module_spec,
+    bag_path: Path,
+    output_dir: Path,
+    baseline: Optional[Path] = None,
+    configs_dir: Path = DEFAULT_CONFIGS_DIR,
+) -> int:
     """Run the registered perception plugins + faithfulness over an output bag,
     generate the report, and return the B9 exit code.
 
     Shared by `all --run-metrics` (post-replay) and the standalone `metrics`
     subcommand (offline, on a downloaded output bag — no replay/Docker/GPU).
+
+    BASELINE (plan 01-15 / UAT gap 2): when ``baseline`` is given, every
+    ``requires_baseline`` plugin is gated via ``compare(candidate, baseline, cfg)``
+    instead of being skipped — this is the perception regression path
+    (``mask_iou_vs_golden`` vs a pinned golden). FAIL-CLOSED: a baseline that yields
+    no comparable frames produces a ``None`` headline scalar, so ``generator.py``
+    emits a visible no-scalar row (never a silent pass / false green). When NO
+    baseline is given, requires_baseline plugins are left OUT of the results so the
+    generator emits its existing visible "skipped" row (warning-only until curated
+    goldens land) — never a silent pass and never a false fail.
     """
-    import replay.metrics.perception  # noqa: F401 — import triggers plugin self-registration for all 7
+    import replay.metrics.perception  # noqa: F401 — import triggers plugin self-registration (6 plugins)
     from replay.metrics.base import MetricResult
     from replay.metrics.bag_reader import BagReader
     from replay.metrics.registry import get_metric_plugins
@@ -61,6 +101,9 @@ def _run_metrics_pipeline(module_spec, bag_path: Path, output_dir: Path) -> int:
     reader = BagReader(bag_path, topics)
     cfg = _build_metrics_cfg(module_spec)
 
+    baseline_bag = _resolve_baseline_bag(baseline, module_spec, configs_dir)
+    baseline_reader = BagReader(baseline_bag, topics) if baseline_bag is not None else None
+
     # Validity tier: faithfulness is invoked EXPLICITLY (it is deliberately not
     # registered as a quality plugin — 01-06), so it gates as the validity tier.
     faithfulness = ReplayFaithfulnessMetric().compute(reader, cfg)
@@ -69,8 +112,25 @@ def _run_metrics_pipeline(module_spec, bag_path: Path, output_dir: Path) -> int:
     for plugin_cls in get_metric_plugins(module_spec.name):
         plugin = plugin_cls()
         if getattr(plugin, "requires_baseline", False):
-            # Regression metrics gate via compare(candidate, baseline); the
-            # baseline (--baseline) wiring lands in MOD-01 e2e / Phase 2.
+            if baseline_reader is None:
+                # No baseline: leave the regression metric OUT of results so the
+                # generator emits its visible "skipped" warning row (warning-only
+                # until curated goldens land). Never a silent pass, never a false
+                # fail. (UAT gap 2 fail-closed-on-absence.)
+                continue
+            # Regression path: gate via compare(candidate, baseline). The plugin's
+            # top-level scalar (== plugin.name) is what generator.py enforces the
+            # threshold against; a None scalar (zero comparable frames) fails closed.
+            value = plugin.compare(reader, baseline_reader, cfg)
+            results.append(
+                MetricResult(
+                    name=plugin.name,
+                    module=module_spec.name,
+                    value=value,
+                    passed=False,
+                    is_regression=True,
+                )
+            )
             continue
         value = plugin.compute(reader, cfg)
         results.append(
@@ -237,6 +297,15 @@ def run(module: str, bag_path: Path, output_dir: Path, configs_dir: Path) -> Non
     help="Cap colcon parallel-workers and MAKEFLAGS -j to N processes. Default 2 - drop to 1 if the laptop still stalls.",
 )
 @click.option("--run-metrics", is_flag=True, default=False)
+@click.option(
+    "--baseline",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Pinned-golden baseline for regression metrics (mask_iou_vs_golden). A "
+    "local rosbag2 path is used directly; any other value resolves the golden via "
+    "BaselineManager (configs/baselines/<module>/golden.yaml -> S3). Without it the "
+    "regression metric is a visible warning-only 'skipped' row.",
+)
 @click.option("--run-viz", is_flag=True, default=False, help="(deferred — no-op in Phase 1)")
 def all_cmd(
     module: str,
@@ -250,6 +319,7 @@ def all_cmd(
     partial_checkout: bool,
     build_jobs: int,
     run_metrics: bool,
+    baseline: Optional[Path],
     run_viz: bool,
 ) -> None:
     """Run all pipeline stages end-to-end."""
@@ -302,7 +372,10 @@ def all_cmd(
         sys.exit(3)
 
     if run_metrics:
-        rc = _run_metrics_pipeline(module_spec, result.output_bag_path, output_dir)
+        rc = _run_metrics_pipeline(
+            module_spec, result.output_bag_path, output_dir,
+            baseline=baseline, configs_dir=configs_dir,
+        )
         if rc != 0:
             sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
     if run_viz:
@@ -320,16 +393,34 @@ def all_cmd(
 @click.option("--bag", "bag_path", required=True, type=click.Path(path_type=Path, exists=True))
 @click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
 @click.option("--configs-dir", type=click.Path(path_type=Path, exists=True), default=DEFAULT_CONFIGS_DIR)
-def metrics_cmd(module: str, bag_path: Path, output_dir: Path, configs_dir: Path) -> None:
+@click.option(
+    "--baseline",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Pinned-golden baseline for regression metrics (mask_iou_vs_golden). A "
+    "local rosbag2 path is used directly; any other value resolves the golden via "
+    "BaselineManager (configs/baselines/<module>/golden.yaml -> S3). Without it the "
+    "regression metric is a visible warning-only 'skipped' row.",
+)
+def metrics_cmd(
+    module: str, bag_path: Path, output_dir: Path, configs_dir: Path,
+    baseline: Optional[Path],
+) -> None:
     """Offline evaluation of an EXISTING output bag: plugins -> criteria -> report + exit code.
 
     The CHEAP runner (B9 CLI table / CI-01): no replay, no Docker, no GPU, and
     no preflight asset gate (it needs no robot assets) — just the offline
     metrics pipeline over a downloaded output bag, exiting per the B9 verdict.
+
+    Pass ``--baseline <golden-bag>`` to run the regression metric
+    (``mask_iou_vs_golden``) via compare(); without it that metric is a visible
+    warning-only "skipped" row (UAT gap 2 / plan 01-15).
     """
     module_spec = load_module_config(module, configs_dir / "modules")
     output_dir.mkdir(parents=True, exist_ok=True)
-    rc = _run_metrics_pipeline(module_spec, bag_path, output_dir)
+    rc = _run_metrics_pipeline(
+        module_spec, bag_path, output_dir, baseline=baseline, configs_dir=configs_dir,
+    )
     if rc != 0:
         sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
 

@@ -76,6 +76,62 @@ def synthetic_bag(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def diagnostics_bag(tmp_path: Path):
+    """Factory: a rosbag2 dir of ``diagnostic_msgs/DiagnosticArray`` messages whose
+    ``seg_argmax`` status carries ``avg_compute_ms`` / ``max_compute_ms`` KeyValues.
+
+    This is the real signal ``LatencyMetric`` parses (the PoC's
+    ``/perception_node/diagnostics`` seg_argmax compute time). The factory takes a
+    list of ``avg_compute_ms`` values and writes one DiagnosticArray per value at
+    0.2 Hz (5 s spacing — the contract's report_interval_sec). Round-trip of these
+    types through the ROS2_HUMBLE typestore is verified in plan 01-13's advisory.
+
+    Returns a callable so a test can pick its own compute values (e.g. p95=60 vs 45).
+    """
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    DiagnosticArray = typestore.types["diagnostic_msgs/msg/DiagnosticArray"]
+    DiagnosticStatus = typestore.types["diagnostic_msgs/msg/DiagnosticStatus"]
+    KeyValue = typestore.types["diagnostic_msgs/msg/KeyValue"]
+    Header = typestore.types["std_msgs/msg/Header"]
+    Time = typestore.types["builtin_interfaces/msg/Time"]
+    mt = DiagnosticArray.__msgtype__
+
+    def _make(
+        avg_values: list[float],
+        topic: str = "/perception_node/diagnostics",
+        stage_name: str = "seg_argmax",
+        name: str = "diag_bag",
+    ) -> Path:
+        bag_dir = tmp_path / name
+        with Writer(bag_dir, version=Writer.VERSION_LATEST) as writer:
+            conn = writer.add_connection(topic, mt, typestore=typestore)
+            for i, avg in enumerate(avg_values):
+                ts = i * 5_000_000_000  # 0.2 Hz (report_interval_sec=5.0)
+                status = DiagnosticStatus(
+                    level=0,
+                    name=stage_name,
+                    message="ok",
+                    hardware_id="gpu",
+                    values=[
+                        KeyValue(key="avg_compute_ms", value=str(float(avg))),
+                        KeyValue(key="max_compute_ms", value=str(float(avg) + 5.0)),
+                    ],
+                )
+                hdr = Header(
+                    stamp=Time(sec=int(ts // 1_000_000_000), nanosec=int(ts % 1_000_000_000)),
+                    frame_id="",
+                )
+                msg = DiagnosticArray(header=hdr, status=[status])
+                writer.write(conn, ts, typestore.serialize_cdr(msg, mt))
+        return bag_dir
+
+    return _make
+
+
+@pytest.fixture
 def perception_spec() -> ModuleSpec:
     return ModuleSpec(
         name="perception",

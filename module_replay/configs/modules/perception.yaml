@@ -66,11 +66,19 @@ diagnostics_topic: /perception_node/diagnostics
 
 thresholds:
   validity:
+    # max_gap_ms is the worst gap among UNIFORM-rate (~10 Hz) topics; the 0.2 Hz diagnostics
+    # topic's legitimate ~5000ms interval is excluded from this headline (UAT gap-1 residual).
     replay_max_gap_ms:
       max: 200
       provisional: true
     replay_drop_rate:
       max: 0.02
+      provisional: true
+    # Rate-aware per-topic gate: faithfulness counts, PER TOPIC, intervals exceeding 2x that
+    # topic's OWN nominal period (cameras 200ms, diagnostics 10000ms). Any breach on ANY topic
+    # invalidates — this gates the slow topics excluded from the flat replay_max_gap_ms headline.
+    replay_breach_count:
+      max: 0
       provisional: true
   quality:
     latency_p95_ms:

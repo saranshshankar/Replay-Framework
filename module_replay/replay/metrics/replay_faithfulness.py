@@ -118,9 +118,17 @@ class ReplayFaithfulnessMetric(BaseMetric):
         per_topic, empty_topics = {}, []
         worst_gap, total_breaches = 0.0, 0
         total_actual, total_expected = 0, 0
+        # The headline max_gap_ms is gated by the flat replay_max_gap_ms threshold (200 ms =
+        # 2x the 10 Hz period), which is only meaningful for UNIFORM-rate topics. Slow
+        # housekeeping topics (e.g. /diagnostics at 0.2 Hz, a legitimate ~5000 ms interval)
+        # are EXCLUDED from worst_gap so a healthy mixed-rate run does not false-INVALID
+        # (UAT gap-1 residual). They are still gated PER TOPIC via breach_count below
+        # (the replay_breach_count validity threshold), so a genuine slow-topic stall is caught.
+        default_hz = self._resolve_default_hz(expected_hz_map)
         for topic in topics:
             # PER-TOPIC rate: cameras 10 Hz (default), diagnostics 0.2 Hz, etc.
             hz = self._expected_hz_for(topic, expected_hz_map)
+            is_uniform = hz >= default_hz   # slow topics excluded from the headline max_gap_ms
             expected_period_ms = 1000.0 / hz
             expected_per_topic = max(int(round(span_s * hz)), 1)
             total_expected += expected_per_topic
@@ -131,7 +139,8 @@ class ReplayFaithfulnessMetric(BaseMetric):
                 per_topic[topic] = {"max_gap_ms": 1e9, "breach_count": 1,
                                     "count": raw_count, "unique_count": int(ts.size)}
                 empty_topics.append(topic)
-                worst_gap = max(worst_gap, 1e9)
+                if is_uniform:
+                    worst_gap = max(worst_gap, 1e9)
                 total_breaches += 1
                 total_actual += int(ts.size)
                 continue
@@ -142,7 +151,8 @@ class ReplayFaithfulnessMetric(BaseMetric):
             breaches = int(np.sum(intervals_ms > 2 * expected_period_ms))
             per_topic[topic] = {"max_gap_ms": max_gap, "breach_count": breaches,
                                 "count": raw_count, "unique_count": int(ts.size)}
-            worst_gap = max(worst_gap, max_gap)
+            if is_uniform:
+                worst_gap = max(worst_gap, max_gap)
             total_breaches += breaches
             total_actual += int(ts.size)   # drop_rate counts UNIQUE frames, not re-emits
         # EQUAL CROSS-CAMERA COUNTS: the 6 semantic streams must agree (within 1 frame).

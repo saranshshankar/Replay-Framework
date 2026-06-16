@@ -42,10 +42,37 @@ class BaselineManager:
         if strategy == "pinned_golden":
             manifest = self._load_golden_manifest(module)
             bag = self._fetch_from_s3(manifest)   # mirror data_manager.resolve_s3_bag
+            # DERIVE aligned_start_ts from the resolved golden bag (UAT gap 2): the
+            # candidate and golden are stamp-aligned for the per-frame mask IoU join,
+            # so the golden's first-message timestamp is the alignment origin — NOT a
+            # hardcoded 0 (which would silently misalign any absolute-time math).
             return BaselineRef(bag_path=bag, strategy="pinned_golden",
-                               aligned_start_ts=0, run_id=str(manifest.get("baseline_sha", "PROVISIONAL")))
+                               aligned_start_ts=self._derive_start_ts(bag),
+                               run_id=str(manifest.get("baseline_sha", "PROVISIONAL")))
         # rerun_dev: local interactive only -- never used by CI
         raise NotImplementedError("rerun_dev is a local-only convenience; not available from CI")
+
+    @staticmethod
+    def _derive_start_ts(bag: Path) -> int:
+        """Read the golden bag's metadata start_time (nanoseconds).
+
+        Uses the same ``rosbags`` reader the metrics layer reads bags with (no ROS
+        runtime). Guarded: an unreadable / empty bag falls back to 0 with a logged
+        note, but the happy path derives the real rosbag2 ``start_time``.
+        """
+        try:
+            from rosbags.rosbag2 import Reader
+
+            with Reader(bag) as reader:
+                return int(reader.start_time)
+        except Exception as exc:  # unreadable / empty golden -> documented fallback
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Could not derive aligned_start_ts from golden bag %s (%s); "
+                "falling back to 0", bag, exc,
+            )
+            return 0
 
     def _fetch_from_s3(self, manifest: dict) -> Path:
         import boto3

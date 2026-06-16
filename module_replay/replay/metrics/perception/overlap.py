@@ -1,10 +1,29 @@
 """Cross-camera semantic overlap consistency metric (MTRC-02).
 
 Ported from the PoC ``perception_metrics/metrics/overlap_metrics.py`` (10xCode
-branch ``aniket/feat/module_wise_replay_poc``). The PoC matched features between
-adjacent-camera RGB frames, fit a RANSAC homography, warped one camera's semantic
-mask into the other's frame, and measured pixel-wise label agreement in the true
-overlap region.
+branch ``aniket/feat/module_wise_replay_poc``). ``cross_camera_overlap_iou``
+measures pixel-wise SEMANTIC-LABEL AGREEMENT in the true warped overlap region on
+a **[0, 1] scale**, so the 0.75 quality gate is meaningful (UAT gap 3: the prior
+AKAZE port had gutted this into an unnormalized RANSAC-inlier proxy of ~0.01-0.25).
+
+Two-phase calibrate-then-agree pipeline (the PoC's), per explicit adjacency pair
+(``OVERLAP_PAIRS``; NOT a flat consecutive-output-topic zip):
+
+  Phase 1 (calibrate): join the pair's ``image_raw_sim`` RGB frames by
+  ``header.stamp``, sample up to ``CALIBRATION_SAMPLES`` frame pairs, AKAZE/ORB
+  feature-match each, and keep the best-inlier RANSAC homography H (RGB_a -> RGB_b).
+  Scale H to the semantic resolution (``_scale_homography_to_semantic``) and
+  compute the overlap mask (``_compute_overlap_mask``). Skip a pair whose
+  calibration fails or whose overlap < ``MIN_OVERLAP_PIXELS``.
+
+  Phase 2 (evaluate): join the pair's ``semantic_raw_sim`` frames by
+  ``header.stamp``; for each pair, warp the class-id plane (the **R channel** of
+  the rgba8 frame, decoded via ``_decode_classid_plane`` — NOT a grayscale of all
+  channels) of camera A into B and measure the [0, 1] label agreement in the
+  overlap mask (``_compute_semantic_agreement``).
+
+The headline scalar ``cross_camera_overlap_iou`` (== ``self.name``) is the mean of
+the per-pair mean agreements, so ``generator.py`` enforces the 0.75 min threshold.
 
 REQUIRED FIRST CODE CHANGE (Q-4 / project Decision):
 The PoC defaulted ``feature_matcher: "lightglue"`` (its ``config.yaml:15`` and
@@ -282,9 +301,27 @@ def _match_orb(gray_a: np.ndarray, gray_b: np.ndarray) -> tuple[np.ndarray, np.n
     return pts_a, pts_b
 
 
+def _camera_topic_map(output_topics: list[str], suffix: str) -> dict[int, str]:
+    """Map camera index -> output topic by the substring ``camera_{N}/{suffix}``."""
+    mapping: dict[int, str] = {}
+    for topic in output_topics:
+        for cam in range(8):  # the rig has cams 0..5; scan a small safe range
+            if f"camera_{cam}/{suffix}" in topic:
+                mapping[cam] = topic
+                break
+    return mapping
+
+
 @register_metric("perception")
 class OverlapMetric(BaseMetric):
-    """Cross-camera overlap IoU via CPU feature matching (AKAZE default)."""
+    """Cross-camera semantic-label agreement [0,1] via CPU feature matching (AKAZE default).
+
+    Calibrate-then-agree, per explicit adjacency pair (see module docstring). The
+    headline ``cross_camera_overlap_iou`` is the mean of per-pair mean agreements,
+    so ``generator.py`` enforces the 0.75 quality gate (SC2). Degrades gracefully
+    (returns ``0.0``, never raises) when no pair calibrates — e.g. the tiny 2x2
+    synthetic frames that yield no AKAZE keypoints.
+    """
 
     name = "cross_camera_overlap_iou"
     requires_baseline = False
@@ -302,37 +339,100 @@ class OverlapMetric(BaseMetric):
                 "use 'akaze' (default) or 'orb'"
             )
 
-        # The PoC matched adjacent CAMERA pairs (cam0/cam1/...). The framework
-        # passes the module's topics in order; we pair consecutive output topics
-        # (the report's overlap config lists adjacent-camera output topics).
         output_topics = config.get("output_topics", [])
+        rgb_topic = _camera_topic_map(output_topics, "image_raw_sim")
+        sem_topic = _camera_topic_map(output_topics, "semantic_raw_sim")
 
-        ious: list[float] = []
-        for topic_a, topic_b in zip(output_topics, output_topics[1:]):
-            frames_a = [_to_gray(m) for _, m in reader.get_messages(topic_a)]
-            frames_b = [_to_gray(m) for _, m in reader.get_messages(topic_b)]
-            frames_a = [f for f in frames_a if f is not None]
-            frames_b = [f for f in frames_b if f is not None]
-            if not frames_a or not frames_b:
+        # Only adjacency pairs whose BOTH cameras have an RGB topic are evaluable.
+        # When the config carries no camera-shaped topics at all (e.g. the tiny
+        # synthetic_bag with one bare image_raw_sim), fall back to pairing the
+        # first two output topics so graceful-degradation still exercises the path.
+        pairs: list[tuple[int | str, int | str, str]] = [
+            (a, b, desc) for a, b, desc in OVERLAP_PAIRS if a in rgb_topic and b in rgb_topic
+        ]
+        if not pairs and len(output_topics) >= 2:
+            pairs = [("_0", "_1", "fallback")]
+            rgb_topic = {"_0": output_topics[0], "_1": output_topics[1]}
+            sem_topic = {}
+
+        per_pair: dict[str, dict] = {}
+        agreements_mean: list[float] = []
+
+        for cam_a, cam_b, description in pairs:
+            # ── Phase 1: calibrate a homography on the RGB pair ──────────────
+            rgb_pairs = _join_by_stamp(
+                reader.get_messages(rgb_topic[cam_a]),
+                reader.get_messages(rgb_topic[cam_b]),
+            )
+            if not rgb_pairs:
                 continue
-            best_inliers = 0
-            for ga, gb in zip(frames_a[:CALIBRATION_SAMPLES], frames_b[:CALIBRATION_SAMPLES]):
-                pts_a, pts_b = match_fn(ga, gb)
-                if len(pts_a) < MIN_MATCHES_FOR_HOMOGRAPHY:
+            step = max(1, len(rgb_pairs) // CALIBRATION_SAMPLES)
+            samples = rgb_pairs[:: step][:CALIBRATION_SAMPLES]
+
+            best_H, best_inliers = None, 0
+            rgb_wh: tuple[int, int] | None = None
+            for msg_a, msg_b in samples:
+                gray_a, gray_b = _to_gray(msg_a), _to_gray(msg_b)
+                if gray_a is None or gray_b is None:
                     continue
-                H, mask = cv2.findHomography(pts_a, pts_b, cv2.RANSAC, 5.0)
-                if H is None or mask is None:
+                pts_a, pts_b = match_fn(gray_a, gray_b)
+                H, inliers = _compute_homography(pts_a, pts_b)
+                if H is not None and inliers > best_inliers:
+                    best_H, best_inliers = H, inliers
+                    rgb_wh = (gray_a.shape[1], gray_a.shape[0])  # (w, h)
+            if best_H is None or rgb_wh is None:
+                continue
+
+            # ── Phase 2: per-stamp semantic-label agreement in the overlap ───
+            sem_a_topic = sem_topic.get(cam_a)
+            sem_b_topic = sem_topic.get(cam_b)
+            if not sem_a_topic or not sem_b_topic:
+                continue
+            sem_pairs = _join_by_stamp(
+                reader.get_messages(sem_a_topic),
+                reader.get_messages(sem_b_topic),
+            )
+            if not sem_pairs:
+                continue
+
+            H_sem = None
+            mask_b = None
+            agree_vals: list[float] = []
+            for msg_a, msg_b in sem_pairs:
+                sem_a = _decode_classid_plane(msg_a)
+                sem_b = _decode_classid_plane(msg_b)
+                if sem_a is None or sem_b is None or sem_a.shape != sem_b.shape:
                     continue
-                inliers = int(mask.sum())
-                if inliers > best_inliers:
-                    best_inliers = inliers
-            if best_inliers >= MIN_MATCHES_FOR_HOMOGRAPHY:
-                # IoU proxy: inlier fraction of the feature correspondences that
-                # survive the homography (a degree-of-geometric-overlap signal).
-                ious.append(min(1.0, best_inliers / max(1, len(frames_a))))
+                if H_sem is None:
+                    sem_wh = (sem_a.shape[1], sem_a.shape[0])  # (w, h)
+                    H_sem = _scale_homography_to_semantic(best_H, rgb_wh, sem_wh)
+                    _, mask_b = _compute_overlap_mask(H_sem, sem_wh)
+                    if int(mask_b.sum()) < MIN_OVERLAP_PIXELS:
+                        break  # overlap too small -> skip this pair (PoC guard)
+                agreement = _compute_semantic_agreement(sem_a, sem_b, H_sem, mask_b)
+                if agreement is not None:
+                    agree_vals.append(agreement)
+
+            if not agree_vals:
+                continue
+            mean_agreement = float(np.mean(agree_vals))
+            agreements_mean.append(mean_agreement)
+            per_pair[f"cam{cam_a}_cam{cam_b}"] = {
+                "description": description,
+                "num_frames": len(agree_vals),
+                "calibration_inliers": best_inliers,
+                "mean_agreement": round(mean_agreement, 4),
+                "min_agreement": round(float(np.min(agree_vals)), 4),
+                "overlap_pixels": int(mask_b.sum()) if mask_b is not None else 0,
+            }
 
         return {
-            "cross_camera_overlap_iou": round(float(np.mean(ious)), 4) if ious else 0.0,
-            "num_pairs": len(ious),
+            # headline scalar (== self.name) in [0,1] = mean of per-pair means, so
+            # generator.py enforces the 0.75 min quality gate (SC2).
+            "cross_camera_overlap_iou": (
+                round(float(np.mean(agreements_mean)), 4) if agreements_mean else 0.0
+            ),
+            "num_pairs": len(agreements_mean),
             "feature_matcher": matcher,
+            "pairs": per_pair,
         }

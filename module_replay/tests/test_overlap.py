@@ -119,10 +119,28 @@ SEM_B = f"/perception_node/camera_{_CAM_B}/semantic_raw_sim"
 OVERLAP_TOPICS = [RGB_A, RGB_B, SEM_A, SEM_B]
 
 
-def _textured_rgb(side: int = 128, seed: int = 0) -> np.ndarray:
-    """A richly textured HxWx3 uint8 RGB frame (AKAZE finds plenty of keypoints)."""
+def _textured_rgb(side: int = 160, seed: int = 7) -> np.ndarray:
+    """A feature-rich HxWx3 uint8 RGB frame (AKAZE finds plenty of stable corners).
+
+    Pure i.i.d. noise yields too few repeatable AKAZE keypoints (< MIN_MATCHES);
+    scattered rectangles + circles + light noise give strong, repeatable corners so
+    matching the SAME scene against itself fits a near-identity homography with many
+    inliers — the calibration the metric needs.
+    """
+    import cv2
+
     rng = np.random.default_rng(seed)
-    return rng.integers(0, 256, size=(side, side, 3), dtype=np.uint8)
+    img = np.zeros((side, side, 3), dtype=np.uint8)
+    for _ in range(60):
+        x, y = rng.integers(0, side - 20, 2)
+        w, h = rng.integers(6, 20, 2)
+        cv2.rectangle(img, (int(x), int(y)), (int(x + w), int(y + h)),
+                      rng.integers(60, 256, 3).tolist(), -1)
+    for _ in range(40):
+        c = rng.integers(8, side - 8, 2)
+        cv2.circle(img, (int(c[0]), int(c[1])), int(rng.integers(3, 9)),
+                   rng.integers(60, 256, 3).tolist(), -1)
+    return cv2.add(img, rng.integers(0, 40, (side, side, 3)).astype(np.uint8))
 
 
 def _classid_rgba(classid_plane: np.ndarray) -> np.ndarray:
@@ -138,7 +156,7 @@ def _write_overlap_bag(
     bag_dir: Path,
     sem_a_plane: np.ndarray,
     sem_b_plane: np.ndarray,
-    rgb_side: int = 128,
+    rgb_side: int = 160,
     n_frames: int = 6,
 ) -> Path:
     """Write a rosbag2 with two adjacent cameras' RGB (identical textured scene)

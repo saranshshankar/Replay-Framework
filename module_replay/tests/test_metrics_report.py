@@ -56,6 +56,35 @@ def test_validity_breach_forces_fail(tmp_path):
     assert doc["verdict"] == "INVALID" and doc["pass"] is False
 
 
+def test_validity_missing_key_fails_closed(tmp_path):
+    """WR-03: a validity threshold whose faithfulness key is ABSENT must fail
+    closed (exit 2 / INVALID), never silently pass. Today it wrongly returns 0."""
+    th = {"replay_jitter_ms": ThresholdSpec(max=50.0, tier="validity")}
+    rc = generate_report(
+        "perception", "t", [], tmp_path, th,
+        faithfulness={"max_gap_ms": 100.0, "breach_count": 0, "drop_rate": 0.0},
+    )
+    assert rc == 2
+    doc = json.loads((tmp_path / "metrics.json").read_text())
+    assert doc["verdict"] == "INVALID" and doc["pass"] is False
+
+
+def test_validity_missing_key_is_visible(tmp_path):
+    """WR-03: the unevaluable validity threshold is surfaced VISIBLY (not silent) —
+    the faithfulness block reads 'fail' AND a metrics row records it with passed:None
+    and a note naming the missing faithfulness field."""
+    th = {"replay_jitter_ms": ThresholdSpec(max=50.0, tier="validity")}
+    generate_report(
+        "perception", "t", [], tmp_path, th,
+        faithfulness={"max_gap_ms": 100.0, "breach_count": 0, "drop_rate": 0.0},
+    )
+    doc = json.loads((tmp_path / "metrics.json").read_text())
+    assert doc["replay_faithfulness"]["verdict"] == "fail"
+    rows = [m for m in doc["metrics"] if m["name"] == "replay_jitter_ms"]
+    assert rows and rows[0]["passed"] is None
+    assert "jitter_ms" in rows[0]["note"]
+
+
 def test_uncomputed_threshold_skipped(tmp_path):
     """A configured threshold with no computed metric is a visible 'skipped' row, never a failure."""
     th = {

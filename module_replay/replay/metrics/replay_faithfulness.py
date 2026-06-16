@@ -38,6 +38,30 @@ class ReplayFaithfulnessMetric(BaseMetric):
         return float(expected_hz)
 
     @staticmethod
+    def _unique_stamps_ns(messages) -> tuple[np.ndarray, int]:
+        """Return (sorted unique stamps in ns, raw message count) for a topic.
+
+        Dedup is by the message HEADER stamp when the decoded message exposes
+        ``header.stamp`` (sec/nanosec -> ns) -- the contract's stamp-level dedup
+        (``getLatest()`` is non-consuming, ``topic_reader.hpp:84-88``, and can re-emit
+        the same stamp, inflating a raw message count). Falls back to the bag-write
+        timestamp when no header stamp is present. The raw count is preserved
+        alongside ``unique_count`` so a large raw/unique gap stays visible.
+        """
+        raw_count = len(messages)
+        stamps: list[int] = []
+        for write_ts, msg in messages:
+            hdr = getattr(msg, "header", None)
+            stamp = getattr(hdr, "stamp", None) if hdr is not None else None
+            if stamp is not None and hasattr(stamp, "sec") and hasattr(stamp, "nanosec"):
+                stamps.append(int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec))
+            else:
+                stamps.append(int(write_ts))  # fallback: bag-write timestamp
+        if not stamps:
+            return np.empty(0, dtype=float), raw_count
+        return np.unique(np.array(stamps, dtype=float)), raw_count
+
+    @staticmethod
     def _expected_hz_for(topic: str, expected_hz) -> float:
         """Return the expected publish rate (Hz) for ``topic``.
 
@@ -58,6 +82,20 @@ class ReplayFaithfulnessMetric(BaseMetric):
         return float(expected_hz.get("default", 10.0))
 
     def compute(self, reader, config: dict) -> dict:
+        """Validity-tier faithfulness with per-topic rate + the contract's structural checks.
+
+        Structural checks (KT/PERCEPTION-REPLAY-CONTRACT.md §5 "Also validated structurally"):
+          * UNIQUE-STAMP DEDUP -- gap/count math is over de-duplicated header stamps so a
+            non-consuming ``getLatest()`` re-emit cannot inflate counts. ``unique_count`` and
+            the raw ``count`` are both recorded per topic.
+          * EQUAL CROSS-CAMERA COUNTS -- the 6 semantic cameras (``semantic_raw_sim``) must
+            carry equal unique counts (TimeSync emits complete 6-sets only, so inequality is a
+            red flag). DECISION: a mismatch is surfaced as ``cross_camera_count_mismatch=True``
+            with the per-camera ``cross_camera_counts`` AND contributes a breach -- a partial
+            starve (each camera still has >=2 frames) would otherwise NOT trip the C1
+            empty-topic rule, so without a breach contribution it could pass silently. This
+            mirrors the WR-03 fail-closed / no-silent-pass philosophy (01-11).
+        """
         topics = config.get("output_topics") or config.get("input_topics") or []
         # 01-10 threads a per-topic map (e.g. {"default": 10.0, "diagnostics": 0.2})
         # into cfg["expected_hz"]; older callers/tests pass a bare scalar. Both shapes
@@ -73,8 +111,10 @@ class ReplayFaithfulnessMetric(BaseMetric):
         if span_s == 0.0:
             # Nothing (or a single message) in the whole output bag: maximally invalid.
             return {"max_gap_ms": 1e9, "breach_count": len(topics), "drop_rate": 1.0,
-                    "per_topic": {t: {"max_gap_ms": 1e9, "breach_count": 1, "count": 0} for t in topics},
-                    "empty_topics": list(topics), "tier": "validity"}
+                    "per_topic": {t: {"max_gap_ms": 1e9, "breach_count": 1, "count": 0, "unique_count": 0}
+                                  for t in topics},
+                    "empty_topics": list(topics), "cross_camera_count_mismatch": False,
+                    "cross_camera_counts": {}, "tier": "validity"}
         per_topic, empty_topics = {}, []
         worst_gap, total_breaches = 0.0, 0
         total_actual, total_expected = 0, 0
@@ -84,24 +124,38 @@ class ReplayFaithfulnessMetric(BaseMetric):
             expected_period_ms = 1000.0 / hz
             expected_per_topic = max(int(round(span_s * hz)), 1)
             total_expected += expected_per_topic
-            ts = np.array([t for t, _ in reader.get_messages(topic)], dtype=float)
+            # UNIQUE-STAMP DEDUP before the gap/drop math (re-emit must not inflate counts).
+            ts, raw_count = self._unique_stamps_ns(reader.get_messages(topic))
             if ts.size < 2:
                 # empty/singleton topic over a non-trivial span = a validity breach, not a free pass
-                per_topic[topic] = {"max_gap_ms": 1e9, "breach_count": 1, "count": int(ts.size)}
+                per_topic[topic] = {"max_gap_ms": 1e9, "breach_count": 1,
+                                    "count": raw_count, "unique_count": int(ts.size)}
                 empty_topics.append(topic)
                 worst_gap = max(worst_gap, 1e9)
                 total_breaches += 1
                 total_actual += int(ts.size)
                 continue
-            intervals_ms = np.diff(np.sort(ts)) / 1e6
+            intervals_ms = np.diff(ts) / 1e6   # ts is already sorted-unique
             max_gap = float(np.max(intervals_ms))
             # breach threshold is PER-TOPIC: 2 * this topic's nominal period
             # (diagnostics at 0.2 Hz => 10000 ms, not the cameras' 200 ms).
             breaches = int(np.sum(intervals_ms > 2 * expected_period_ms))
-            per_topic[topic] = {"max_gap_ms": max_gap, "breach_count": breaches, "count": int(ts.size)}
+            per_topic[topic] = {"max_gap_ms": max_gap, "breach_count": breaches,
+                                "count": raw_count, "unique_count": int(ts.size)}
             worst_gap = max(worst_gap, max_gap)
             total_breaches += breaches
-            total_actual += int(ts.size)
+            total_actual += int(ts.size)   # drop_rate counts UNIQUE frames, not re-emits
+        # EQUAL CROSS-CAMERA COUNTS: the 6 semantic streams must agree (within 1 frame).
+        cross_camera_counts = {
+            t: per_topic[t]["unique_count"] for t in topics if "semantic_raw_sim" in t
+        }
+        cross_camera_count_mismatch = False
+        if len(cross_camera_counts) >= 2:
+            counts = list(cross_camera_counts.values())
+            # tolerance: all within 1 frame of each other (BestEffort startup jitter)
+            if (max(counts) - min(counts)) > 1:
+                cross_camera_count_mismatch = True
+                total_breaches += 1   # fail-closed: a partial starve must not pass silently
         drop_rate = ((total_expected - total_actual) / total_expected) if total_expected else 0.0
         return {
             "max_gap_ms": worst_gap,
@@ -109,5 +163,7 @@ class ReplayFaithfulnessMetric(BaseMetric):
             "drop_rate": float(min(max(drop_rate, 0.0), 1.0)),
             "per_topic": per_topic,
             "empty_topics": empty_topics,
+            "cross_camera_count_mismatch": cross_camera_count_mismatch,
+            "cross_camera_counts": cross_camera_counts,
             "tier": "validity",
         }

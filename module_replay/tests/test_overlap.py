@@ -103,3 +103,159 @@ def test_semantic_agreement_empty_overlap_is_none():
     sem = np.zeros((112, 112), dtype=np.int16)
     mask_b = np.zeros((112, 112), dtype=bool)
     assert _compute_semantic_agreement(sem, sem, np.eye(3), mask_b) is None
+
+
+# ── Task 2: OverlapMetric.compute calibrate-then-agree pipeline ─────────────
+
+# Adjacency pair (2, 3) is in the PoC OVERLAP_PAIRS; build a bag with those two
+# cameras' image_raw_sim (textured RGB so AKAZE matches) + semantic_raw_sim
+# (rgba8, R = class id) so the metric can calibrate a homography and then measure
+# pixel-wise label agreement in the true overlap region.
+_CAM_A, _CAM_B = 2, 3
+RGB_A = f"/perception_node/camera_{_CAM_A}/image_raw_sim"
+RGB_B = f"/perception_node/camera_{_CAM_B}/image_raw_sim"
+SEM_A = f"/perception_node/camera_{_CAM_A}/semantic_raw_sim"
+SEM_B = f"/perception_node/camera_{_CAM_B}/semantic_raw_sim"
+OVERLAP_TOPICS = [RGB_A, RGB_B, SEM_A, SEM_B]
+
+
+def _textured_rgb(side: int = 128, seed: int = 0) -> np.ndarray:
+    """A richly textured HxWx3 uint8 RGB frame (AKAZE finds plenty of keypoints)."""
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 256, size=(side, side, 3), dtype=np.uint8)
+
+
+def _classid_rgba(classid_plane: np.ndarray) -> np.ndarray:
+    """Pack a HxW int class-id plane into an rgba8 HxWx4 uint8 frame (R = class id)."""
+    h, w = classid_plane.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., 0] = classid_plane.astype(np.uint8)  # R channel carries the class id
+    rgba[..., 3] = 255
+    return rgba
+
+
+def _write_overlap_bag(
+    bag_dir: Path,
+    sem_a_plane: np.ndarray,
+    sem_b_plane: np.ndarray,
+    rgb_side: int = 128,
+    n_frames: int = 6,
+) -> Path:
+    """Write a rosbag2 with two adjacent cameras' RGB (identical textured scene)
+    + their semantic class-id planes, joined by header.stamp.
+
+    Both cameras observe the SAME textured RGB scene so AKAZE/RANSAC fits a near-
+    identity homography (full overlap). The semantic agreement is then driven
+    entirely by how similar ``sem_a_plane`` and ``sem_b_plane`` are.
+    """
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    Image = typestore.types["sensor_msgs/msg/Image"]
+    Header = typestore.types["std_msgs/msg/Header"]
+    Time = typestore.types["builtin_interfaces/msg/Time"]
+
+    rgb = _textured_rgb(rgb_side, seed=7)
+    rgba_a = _classid_rgba(sem_a_plane)
+    rgba_b = _classid_rgba(sem_b_plane)
+    sem_h, sem_w = sem_a_plane.shape
+
+    def _img(arr, encoding, ts):
+        sec, nanosec = ts // 1_000_000_000, ts % 1_000_000_000
+        hdr = Header(stamp=Time(sec=int(sec), nanosec=int(nanosec)), frame_id="cam")
+        h, w = arr.shape[:2]
+        ch = arr.shape[2] if arr.ndim == 3 else 1
+        return Image(
+            header=hdr, height=h, width=w, encoding=encoding, is_bigendian=0,
+            step=w * ch, data=np.ascontiguousarray(arr).reshape(-1).astype(np.uint8),
+        )
+
+    with Writer(bag_dir, version=Writer.VERSION_LATEST) as writer:
+        conns = {
+            RGB_A: writer.add_connection(RGB_A, Image.__msgtype__, typestore=typestore),
+            RGB_B: writer.add_connection(RGB_B, Image.__msgtype__, typestore=typestore),
+            SEM_A: writer.add_connection(SEM_A, Image.__msgtype__, typestore=typestore),
+            SEM_B: writer.add_connection(SEM_B, Image.__msgtype__, typestore=typestore),
+        }
+        for i in range(n_frames):
+            ts = i * 100_000_000  # 10 Hz; identical stamps across topics -> join
+            writer.write(conns[RGB_A], ts, typestore.serialize_cdr(
+                _img(rgb, "rgb8", ts), Image.__msgtype__))
+            writer.write(conns[RGB_B], ts, typestore.serialize_cdr(
+                _img(rgb, "rgb8", ts), Image.__msgtype__))
+            writer.write(conns[SEM_A], ts, typestore.serialize_cdr(
+                _img(rgba_a, "rgba8", ts), Image.__msgtype__))
+            writer.write(conns[SEM_B], ts, typestore.serialize_cdr(
+                _img(rgba_b, "rgba8", ts), Image.__msgtype__))
+    return bag_dir
+
+
+def _overlap_cfg() -> dict:
+    return {"output_topics": OVERLAP_TOPICS}  # no feature_matcher -> akaze default
+
+
+def test_compute_returns_scale_zero_to_one_for_consistent_masks(tmp_path):
+    """Spatially-consistent pair -> cross_camera_overlap_iou is a [0,1] scalar
+    reflecting HIGH semantic-label agreement (NOT an unnormalized inlier proxy)."""
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.perception.overlap import OverlapMetric
+
+    sem = (np.indices((96, 96)).sum(0) % 6).astype(np.int16)  # structured class ids
+    bag = _write_overlap_bag(tmp_path / "consistent", sem, sem.copy())
+    reader = BagReader(bag, OVERLAP_TOPICS)
+    out = OverlapMetric().compute(reader, _overlap_cfg())
+
+    assert "cross_camera_overlap_iou" in out
+    val = out["cross_camera_overlap_iou"]
+    assert isinstance(val, float) and 0.0 <= val <= 1.0
+    assert val > 0.75  # identical masks in the overlap region -> high agreement
+    json.dumps(out)
+
+
+def test_gate_enforces_high_passes_low_fails(tmp_path):
+    """SC2: via generate_report with the 0.75 min threshold, a high-agreement run
+    passes (exit 0) and a mismatched-class-id run fails (exit 1)."""
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.base import MetricResult
+    from replay.metrics.perception.overlap import OverlapMetric
+    from replay.metrics.report.generator import generate_report
+    from replay.module_config import ThresholdSpec
+
+    th = {"cross_camera_overlap_iou": ThresholdSpec(min=0.75, tolerance_band=0.03, tier="quality")}
+
+    def _run(sem_a, sem_b, name):
+        bag = _write_overlap_bag(tmp_path / name, sem_a, sem_b)
+        reader = BagReader(bag, OVERLAP_TOPICS)
+        val = OverlapMetric().compute(reader, _overlap_cfg())
+        mr = MetricResult(
+            name="cross_camera_overlap_iou", module="perception",
+            value=val, passed=False, is_regression=False,
+        )
+        return generate_report("perception", name, [mr], tmp_path / f"{name}_rep", th)
+
+    sem = (np.indices((96, 96)).sum(0) % 6).astype(np.int16)
+    # High agreement: identical masks -> PASS (0).
+    assert _run(sem, sem.copy(), "high") == 0
+    # Low agreement: B's overlap class ids are all shifted -> mismatched -> FAIL (1).
+    mismatched = ((sem + 1) % 6).astype(np.int16)
+    assert _run(sem, mismatched, "low") == 1
+
+
+def test_compute_degrades_gracefully_on_tiny_bag(synthetic_bag):
+    """Graceful degradation (akaze default, no torch): the tiny 2x2 synthetic_bag
+    has no AKAZE keypoints, so compute returns a typed JSON-serializable result with
+    cross_camera_overlap_iou present (0.0) — never raises. (Parity with the old
+    test_overlap_defaults_to_akaze intent, in this plan's owned file.)"""
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.perception.overlap import OverlapMetric
+
+    IN = "/perception_node/camera_0/image_raw"
+    OUT = "/perception_node/camera_0/image_raw_sim"
+    reader = BagReader(synthetic_bag, [IN, OUT])
+    # No feature_matcher key -> must default to akaze and run without torch.
+    out = OverlapMetric().compute(reader, {"input_topics": [IN], "output_topics": [OUT]})
+    assert "cross_camera_overlap_iou" in out
+    assert out["cross_camera_overlap_iou"] == 0.0
+    assert out.get("feature_matcher") == "akaze"
+    json.dumps(out)

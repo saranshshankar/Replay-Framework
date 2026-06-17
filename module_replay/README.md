@@ -167,6 +167,62 @@ replay-module run --module perception --bag /tmp/out/rosbag2_x --output /tmp/out
 replay-module all --module perception --local-bag /path/to/bag --output /tmp/out
 ```
 
+### Debugging a failed run
+
+When `replay-module all` / `run` / `metrics` finishes, everything you need to
+debug lands under the `--output` directory you passed:
+
+- **Output bag** — `<output>/replay_output` (the module's recorded output, MCAP).
+- **Logs** — `<output>/logs/` holds two per-run files (persisted since they used
+  to be clobbered in the scratch workdir):
+  - `recorder.log` — the rosbag2 recorder's stdout/stderr.
+  - `module.log` — the module/launch stdout+stderr. **This is the first place to
+    look on a failure** (a missing TensorRT engine, a launch crash, an
+    unreachable topic all surface here).
+- **Report** — `<output>/reports/report.html` (open it in a browser) plus
+  `<output>/reports/metrics.json` (the machine-readable verdict the CI gate
+  reads). The report's **Debug** section links the bag/logs above, so the HTML
+  is a single entry point to the run's artifacts.
+
+On a red CI check, the same artifacts are uploaded from the PR's `replay-gate`
+run. Open the failed run in the repository's **Actions** tab — the gate's job
+**summary** links straight to the run's **Artifacts**, where you can download:
+
+- `logs-perception-<run_id>` — `recorder.log` + `module.log`.
+- `output-bag-perception-<run_id>` — the replay output bag.
+- `report-perception-<run_id>` — `report.html` + `metrics.json`.
+
+These artifacts are **ephemeral**: every upload sets `retention-days: 5`
+("delete after a few days"), so pull them while you are still debugging. The
+nightly (`replay-nightly`) uploads the same three artifacts so a failed nightly
+is debuggable too.
+
+Once you have the bag, reproduce the verdict locally with the **cheap offline
+path** — no GPU, no Docker, no replay (it only recomputes the metrics on the
+downloaded bag):
+
+```bash
+replay-module metrics --module perception \
+  --bag <downloaded-bag>/replay_output --output /tmp/dbg
+# then open /tmp/dbg/reports/report.html
+```
+
+The exit code tells you which kind of failure it was (same contract locally and
+in CI):
+
+| Code | Meaning | What to do |
+|------|---------|------------|
+| `0` | PASS | — |
+| `1` | quality FAIL (a module-output metric breached its threshold) | inspect the failing metric row in `report.html` |
+| `2` | INVALID RUN (replay-faithfulness breach — dropped frames / gaps; likely infra noise) | re-run; not a code regression |
+| `3` | setup-or-replay error (the run never produced a usable bag) | read `module.log` (its path is echoed on this branch) |
+
+> **Local rich visualization is a follow-on.** A richer *local* viz mode
+> (`replay-module ... --run-viz`) — overlays, comparison video — is a staged
+> **follow-on** and deliberately stays **out of CI** (heavy video/comparison viz
+> is not part of the gate). Today `--run-viz` prints a scope-honest deferral
+> notice; use the `report.html` plots above in the meantime.
+
 ### Version YAML format
 
 ```yaml

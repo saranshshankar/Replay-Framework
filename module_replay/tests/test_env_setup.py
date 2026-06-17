@@ -61,7 +61,7 @@ def test_setup_planner_path(perception_spec, mocker):
     container_arg, cmd = exec_in.call_args.args
     assert container_arg == paths.PLANNER_CONTAINER
     assert "source /opt/ros/humble/setup.bash" in cmd
-    assert "colcon build --packages-up-to realtime_perception" in cmd
+    assert "colcon build --symlink-install --packages-up-to realtime_perception" in cmd
 
 
 def test_setup_controller_path(manipulation_spec, mocker):
@@ -78,7 +78,7 @@ def test_setup_controller_path(manipulation_spec, mocker):
     container_arg, cmd = exec_in.call_args.args
     assert container_arg == paths.CONTROLLER_CONTAINER
     assert "source /opt/ros/humble/setup.bash" in cmd
-    assert "colcon build --packages-up-to manipulation_manager" in cmd
+    assert "colcon build --symlink-install --packages-up-to manipulation_manager" in cmd
 
 
 def test_setup_applies_submodule_overrides(perception_spec, mocker):
@@ -140,7 +140,7 @@ def test_setup_default_build_jobs_caps_parallelism(perception_spec, mocker):
     _, cmd = exec_in.call_args.args
     assert "MAKEFLAGS='-j2'" in cmd
     assert "--parallel-workers 2" in cmd
-    assert "colcon build --packages-up-to realtime_perception" in cmd
+    assert "colcon build --symlink-install --packages-up-to realtime_perception" in cmd
 
 
 def test_setup_custom_build_jobs(perception_spec, mocker):

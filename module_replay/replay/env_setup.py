@@ -125,13 +125,23 @@ def setup_environment(
     # Source ROS Humble (and any existing overlay from a prior build) before
     # running colcon. The container's ~/.bashrc sources both, but it bails
     # early for non-interactive shells, so `bash -lc` never picks them up.
+    #
+    # --symlink-install is load-bearing for replay: the module launch files
+    # resolve their config from the INSTALL space (e.g. perception_node.launch.py
+    # reads perception_sim.yaml via get_package_share_directory). Without it,
+    # configs are COPIED at build time, so an edited source YAML only reaches the
+    # node if the install/copy step re-runs — fragile for config-only edits and
+    # invisible if the package resolves to a pre-built underlay. Symlinking makes
+    # install-space configs live pointers to source. It is also 10xCode's own
+    # convention (their CLAUDE.md / build.md default to --symlink-install).
     build_cmd = (
         "source /opt/ros/humble/setup.bash && "
         "{ [ -f /root/ros2_ws/install/setup.bash ] && "
         "source /root/ros2_ws/install/setup.bash; } ; "
         f"cd /root/ros2_ws && "
         f"MAKEFLAGS='-j{build_jobs}' "
-        f"colcon build --packages-up-to {module.colcon_package} "
+        f"colcon build --symlink-install "
+        f"--packages-up-to {module.colcon_package} "
         f"--parallel-workers {build_jobs}"
     )
     exec_in_container(container, build_cmd)

@@ -138,6 +138,7 @@ def _run_and_capture_script(tmp_path: Path, perception_spec, mocker, exit_code: 
     exec_mock = mocker.patch("replay.runner.exec_in_container", return_value=exit_code)
     mocker.patch("replay.runner.shutil.move")
     mocker.patch("replay.runner.shutil.copytree")
+    mocker.patch("replay.runner.shutil.copy")  # QoS file staging — no real IO in tests
     result = run_replay(module=perception_spec, data=data_ref, output_dir=tmp_path / "out")
     _, script = exec_mock.call_args.args
     return result, script
@@ -190,9 +191,20 @@ def test_run_replay_prefers_spec_qos_override_path(tmp_path: Path, mocker):
     exec_mock = mocker.patch("replay.runner.exec_in_container", return_value=0)
     mocker.patch("replay.runner.shutil.move")
     mocker.patch("replay.runner.shutil.copytree")
+    copy_mock = mocker.patch("replay.runner.shutil.copy")
     run_replay(module=spec, data=data_ref, output_dir=tmp_path / "out")
     _, script = exec_mock.call_args.args
-    assert str(custom_qos) in script
+    # The script runs in the container: it must reference the CONTAINER-staged
+    # QoS path, never the host path. (Regression guard — the previous assertion
+    # checked for the host path, which is exactly the bug that broke bag play.)
+    from replay import paths
+
+    container_qos = str(paths.CONTAINER_REPLAY_WORKDIR / "qos_override.yaml")
+    assert container_qos in script
+    assert str(custom_qos) not in script
+    copy_mock.assert_called_once_with(
+        custom_qos, paths.HOST_REPLAY_WORKDIR / "qos_override.yaml"
+    )
     assert dataclasses.is_dataclass(spec)  # spec is the typed source of the path
 
 

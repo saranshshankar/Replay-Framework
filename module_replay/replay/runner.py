@@ -204,10 +204,18 @@ def run_replay(
     package_root = Path(__file__).resolve().parent.parent
     if module.qos_override_path is not None:
         spec_qos = Path(module.qos_override_path)
-        qos_override_path = spec_qos if spec_qos.is_absolute() else package_root / spec_qos
+        qos_host = spec_qos if spec_qos.is_absolute() else package_root / spec_qos
     else:
-        qos_override_path = package_root / "configs" / "qos" / f"{module.name}.yaml"
-    if not qos_override_path.exists():
+        qos_host = package_root / "configs" / "qos" / f"{module.name}.yaml"
+    # The replay script runs INSIDE the container, where a host path to the QoS
+    # file does not exist — passing it would make `ros2 bag play` die ("file not
+    # found"). The framework's configs/ dir is not bind-mounted, so stage the
+    # file into the writable workdir (which IS mounted) and pass the CONTAINER
+    # path, exactly as the input bag is staged above.
+    if qos_host.exists():
+        shutil.copy(qos_host, work_host / "qos_override.yaml")
+        qos_override_path = work_container / "qos_override.yaml"
+    else:
         qos_override_path = None
 
     script = _build_replay_script(

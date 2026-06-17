@@ -142,9 +142,11 @@ replay-module fetch-data --task-id task_20260409_184409 --robot-id robot_03 --ou
 # round-trip and no flag toggling. The image is also built on demand if
 # the compose file declares a `build:` section and no image is available.
 #
-# By default the colcon build runs with `--parallel-workers 2` and
-# `MAKEFLAGS=-j2` so the laptop stays responsive (≤4 compiler processes
-# at once). Override with `--build-jobs N`: pick higher (faster, hungrier)
+# By default the colcon build runs with `--symlink-install` (so edited
+# module configs/launch files take effect without a copy step — load-bearing
+# for replay), `--parallel-workers 2` and `MAKEFLAGS=-j2` so the laptop stays
+# responsive (≤4 compiler processes at once). Override with `--build-jobs N`:
+# pick higher (faster, hungrier)
 # or 1 (slowest, gentlest) if 2 still stalls.
 replay-module setup-env --module perception --version-yaml configs/versions/default.yaml
 

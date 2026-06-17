@@ -202,7 +202,12 @@ def test_run_replay_prefers_spec_qos_override_path(tmp_path: Path, mocker):
     container_qos = str(paths.CONTAINER_REPLAY_WORKDIR / "qos_override.yaml")
     assert container_qos in script
     assert str(custom_qos) not in script
-    copy_mock.assert_called_once_with(
+    # The QoS file is staged into the host workdir (which IS bind-mounted) and
+    # passed as the container path. Use assert_any_call (not assert_called_once_*)
+    # because run_replay now ALSO copies recorder.log + module.log out to
+    # <output>/logs/ via shutil.copy (01-17) — the QoS copy is no longer the only
+    # shutil.copy invocation.
+    copy_mock.assert_any_call(
         custom_qos, paths.HOST_REPLAY_WORKDIR / "qos_override.yaml"
     )
     assert dataclasses.is_dataclass(spec)  # spec is the typed source of the path

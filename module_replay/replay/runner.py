@@ -30,6 +30,15 @@ BAG_PLAY_READ_AHEAD_QUEUE = 5000
 class RunResult:
     output_bag_path: Path
     exit_code: int
+    # The per-run <output>/logs/ directory holding recorder.log + module.log,
+    # copied off the scratch workdir after the container exits (set for both
+    # success and failure — the logs are the failure evidence a dev pulls).
+    logs_dir: Optional[Path] = None
+
+
+# The two logs the in-container script writes to {log_dir}/. They are read back
+# on the HOST side from paths.HOST_REPLAY_WORKDIR after exec_in_container returns.
+REPLAY_LOG_NAMES = ("recorder.log", "module.log")
 
 
 def _container_for(module: ModuleSpec) -> str:
@@ -235,4 +244,31 @@ def run_replay(
         shutil.rmtree(host_output)
     shutil.move(str(work_host / "replay_output"), str(host_output))
 
-    return RunResult(output_bag_path=host_output, exit_code=exit_code)
+    # Persist the run logs to a STABLE, per-run location (GAP c). The recorder
+    # and module write to {log_dir}/recorder.log + {log_dir}/module.log INSIDE
+    # the container (= work_host/<name> on the host via the bind mount); that
+    # scratch workdir is overwritten by the next run, so copy the logs out to
+    # <output>/logs/ now. This runs for BOTH success and failure paths — a
+    # failed run is exactly when the logs are the evidence a dev needs.
+    #
+    # FAIL-SAFE: the whole copy is best-effort. A missing/unreadable/locked log
+    # (e.g. a launch that never produced module.log) must NOT raise and must NOT
+    # change the exit code — the logs are diagnostics, never a gate (T-17-01).
+    logs_dir = output_dir / "logs"
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        for name in REPLAY_LOG_NAMES:
+            src = work_host / name
+            try:
+                shutil.copy(str(src), str(logs_dir / name))
+            except OSError:
+                # Missing/locked individual log — skip it, keep the others.
+                pass
+    except OSError:
+        # Even mkdir failing must not crash a run; logs_dir is still reported so
+        # the caller echoes the intended path.
+        pass
+
+    return RunResult(
+        output_bag_path=host_output, exit_code=exit_code, logs_dir=logs_dir
+    )

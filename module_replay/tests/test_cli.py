@@ -437,6 +437,26 @@ def test_metrics_subcommand_offline_produces_report(tmp_path: Path, synthetic_ba
     assert "pass" in doc and "verdict" in doc
 
 
+def test_metrics_pipeline_passes_reader_so_plots_render(tmp_path: Path, synthetic_bag, mocker):
+    """Tier-2 plots are DEFAULT on every --run-metrics / metrics run (the agreed scope:
+    'we generate the report anyway'). _run_metrics_pipeline MUST forward a non-None reader
+    to generate_report — 01-16 gates plot rendering on reader != None. Regression guard for
+    the CLI-wiring gap where the reader was built (cli.py:102) but never passed, so a real
+    run produced a report.html with NO plots even though the plots module existed."""
+    spy = mocker.patch(
+        "replay.metrics.report.generator.generate_report", return_value=0
+    )
+    CliRunner().invoke(
+        main,
+        ["metrics", "--module", "perception", "--bag", str(synthetic_bag),
+         "--output", str(tmp_path / "out")],
+    )
+    assert spy.called, "generate_report was not called"
+    assert spy.call_args.kwargs.get("reader") is not None, (
+        "reader not forwarded to generate_report → Tier-2 plots never render on a real run"
+    )
+
+
 def test_build_metrics_cfg_threads_new_keys():
     """01-10 / UAT gaps 1+5: _build_metrics_cfg threads the per-topic expected_hz
     map, depth_topics, and diagnostics_topic from the ModuleSpec into the cfg dict.

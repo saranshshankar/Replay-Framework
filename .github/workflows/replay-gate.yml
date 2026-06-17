@@ -55,6 +55,17 @@ jobs:
         with:
           name: output-bag-${{ env.MODULE }}-${{ github.run_id }}
           path: /tmp/output
+          retention-days: 5          # ephemeral ("delete after a few days") — T-18-04
+      # Upload the run's LOGS from THIS (GPU) job — /tmp/output/logs only exists
+      # here, written by `replay-module all ... --output /tmp/output` (01-17); the
+      # cheap metrics runner only has the downloaded bag. if: always() so a FAILED
+      # replay still uploads its logs — they are the failure evidence (B1).
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ env.MODULE }}-${{ github.run_id }}
+          path: /tmp/output/logs
+          retention-days: 5
 
   metrics:
     needs: replay
@@ -82,12 +93,30 @@ jobs:
         with:
           name: report-perception-${{ github.run_id }}
           path: /tmp/metrics/reports
+          retention-days: 5          # ephemeral — T-18-04
 
   gate:
     needs: [detect, replay, metrics]
     if: always()
     runs-on: ubuntu-22.04
     steps:
+      # Surface the debug artifacts to the developer via the job summary (renders
+      # markdown on the run page; needs NO extra permission — the minimal-perm
+      # option vs. a PR comment). if: always() so the link shows on a FAILED run
+      # too, which is exactly when a dev needs it. The body is built only from
+      # github.* context (not PR-controlled input) — no injection vector (T-18-05).
+      - name: Surface debug artifacts (job summary)
+        if: always()
+        run: |
+          {
+            echo "### Replay debug artifacts"
+            echo ""
+            echo "Download from this run's [Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (ephemeral — retention 5 days):"
+            echo ""
+            echo "- \`logs-perception-${{ github.run_id }}\` — recorder.log + module.log (look here first on a failure)"
+            echo "- \`output-bag-perception-${{ github.run_id }}\` — the replay output bag"
+            echo "- \`report-perception-${{ github.run_id }}\` — report.html (see its Debug section) + metrics.json"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Summarize (single required check for branch protection)
         run: |
           # If perception/framework wasn't touched, replay is skipped -> pass.

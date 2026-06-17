@@ -49,3 +49,39 @@ jobs:
           print("determinism deltas:", {n: abs(float(rows_a[n]['value']) - float(rows_b[n]['value'])) for n in rows_a.keys() & rows_b.keys()})
           sys.exit(1 if bad else 0)
           EOF
+      # Upload the first run's artifacts so a FAILED nightly is debuggable (it
+      # uploaded NOTHING before). The first run uses --run-metrics, so it produced
+      # the bag, logs (01-17), and report under /tmp/nightly. if: always() — the
+      # whole point is to capture a failed/non-deterministic run. retention-days: 5
+      # keeps them ephemeral (T-18-04). No PR context on a cron run, so we surface
+      # via the job summary, not a comment.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: output-bag-perception-${{ github.run_id }}
+          path: /tmp/nightly/replay_output
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-perception-${{ github.run_id }}
+          path: /tmp/nightly/logs
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-perception-${{ github.run_id }}
+          path: /tmp/nightly/reports
+          retention-days: 5
+      - name: Surface nightly debug artifacts (job summary)
+        if: always()
+        run: |
+          {
+            echo "### Nightly debug artifacts"
+            echo ""
+            echo "From [this run's Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (ephemeral — retention 5 days):"
+            echo ""
+            echo "- \`logs-perception-${{ github.run_id }}\` — recorder.log + module.log (first run)"
+            echo "- \`output-bag-perception-${{ github.run_id }}\` — the first run's output bag"
+            echo "- \`report-perception-${{ github.run_id }}\` — report.html + metrics.json"
+          } >> "$GITHUB_STEP_SUMMARY"

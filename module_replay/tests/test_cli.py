@@ -610,6 +610,123 @@ def test_metrics_baseline_fails_closed_on_empty_comparison(tmp_path: Path):
     assert row["value"] is None, row
 
 
+# ── 01-17: cli surfaces the persisted logs path (success AND exit-3 failure) ──
+
+
+def test_all_cmd_echoes_logs_on_success(tmp_path: Path, mocker):
+    """01-17 / GAP c: on a clean run, `all` echoes the <output>/logs/ path so the
+    developer knows where the run logs landed."""
+    from replay.runner import RunResult
+
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    logs_dir = tmp_path / "out" / "logs"
+    mocker.patch("replay.cli.setup_environment")
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[])
+    mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=bag, exit_code=0, logs_dir=logs_dir),
+    )
+    r = CliRunner().invoke(
+        main,
+        ["all", "--module", "perception", "--local-bag", str(bag),
+         "--output", str(tmp_path / "out")],
+    )
+    assert r.exit_code == 0, r.output
+    assert "logs" in r.output.lower()
+    assert str(logs_dir) in r.output
+
+
+def test_all_cmd_echoes_logs_on_exit3_failure(tmp_path: Path, mocker):
+    """01-17 HEADLINE ASK (B1): on the exit-3 replay-failure branch the logs path
+    is printed — the failure logs are EXACTLY what the developer pulls to debug a
+    red run. Mirrors test_all_cmd_propagates_nonzero_exit, plus a logs_dir."""
+    from replay.runner import RunResult
+
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    logs_dir = tmp_path / "out" / "logs"
+    mocker.patch("replay.cli.setup_environment")
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[])
+    mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=bag, exit_code=137, logs_dir=logs_dir),
+    )
+    r = CliRunner().invoke(
+        main,
+        ["all", "--module", "perception", "--local-bag", str(bag),
+         "--output", str(tmp_path / "out")],
+    )
+    assert r.exit_code == 3, r.output      # B9: replay failures still map to 3
+    assert str(logs_dir) in r.output       # ...and the logs path is surfaced
+
+
+def test_run_cmd_echoes_logs(tmp_path: Path, mocker):
+    """01-17: the `run` subcommand echoes the logs dir alongside Output bag/Exit code."""
+    configs = tmp_path / "configs" / "modules"
+    configs.mkdir(parents=True)
+    (configs / "perception.yaml").write_text(
+        """
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics: []
+output_topics: []
+launch:
+  command: "x"
+"""
+    )
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("version: 5")
+    logs_dir = tmp_path / "out" / "logs"
+    run_mock = mocker.patch("replay.cli.run_replay")
+    run_mock.return_value = mocker.MagicMock(
+        output_bag_path=tmp_path / "out" / "replay_output",
+        exit_code=0,
+        logs_dir=logs_dir,
+    )
+    r = CliRunner().invoke(
+        main,
+        ["run", "--module", "perception", "--bag", str(bag),
+         "--output", str(tmp_path / "out"), "--configs-dir", str(configs.parent)],
+    )
+    assert r.exit_code == 0, r.output
+    assert str(logs_dir) in r.output
+
+
+def test_run_metrics_pipeline_passes_run_artifacts(tmp_path: Path, synthetic_bag, mocker):
+    """01-17 wires the run into 01-16's report: --run-metrics threads a run_artifacts
+    dict carrying the bag + logs paths into generate_report (Debug section)."""
+    from replay.runner import RunResult
+
+    mocker.patch("replay.cli.setup_environment")
+    mocker.patch("replay.cli.missing_preflight_assets", return_value=[])
+    logs_dir = tmp_path / "out" / "logs"
+    mocker.patch(
+        "replay.cli.run_replay",
+        return_value=RunResult(output_bag_path=synthetic_bag, exit_code=0, logs_dir=logs_dir),
+    )
+    gen_mock = mocker.patch(
+        "replay.metrics.report.generator.generate_report", return_value=0
+    )
+    out = tmp_path / "out"
+    r = CliRunner().invoke(
+        main,
+        ["all", "--module", "perception", "--local-bag", str(synthetic_bag),
+         "--output", str(out), "--run-metrics"],
+    )
+    assert r.exit_code == 0, r.output
+    gen_mock.assert_called_once()
+    run_artifacts = gen_mock.call_args.kwargs.get("run_artifacts")
+    assert run_artifacts is not None, gen_mock.call_args
+    assert "logs" in run_artifacts
+    assert str(logs_dir) in run_artifacts["logs"]
+    assert "bag" in run_artifacts
+
+
 def test_run_viz_states_deferred(tmp_path: Path, mocker):
     """01-10 / UAT gap 7: --run-viz states viz is deferred to a later phase
     (scope-honest), NOT the old 'not implemented yet' no-op echo."""

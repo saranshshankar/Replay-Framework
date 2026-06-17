@@ -119,3 +119,112 @@ def test_report_html_written(tmp_path):
     th = {"latency_p95_ms": ThresholdSpec(max=50.0, tier="quality")}
     generate_report("perception", "t", [_mr("latency_p95_ms", 10.0)], tmp_path, th)
     assert (tmp_path / "report.html").read_text().strip() != ""
+
+
+# ── 01-16 Task 1: rich report data model (summary block) + run_artifacts ──────
+
+
+def _pass_mr(name, val):
+    return MetricResult(
+        name=name, module="perception", value={name: val}, passed=True, is_regression=False
+    )
+
+
+def test_generate_report_accepts_run_artifacts_optional(tmp_path):
+    """A1/A3: generate_report gains an optional run_artifacts arg WITHOUT changing
+    the B9 exit code, and the existing call shape (no run_artifacts) still works."""
+    th = {"latency_p95_ms": ThresholdSpec(max=50.0, tolerance_band=5.0, tier="quality")}
+    artifacts = {"bag": "/x/replay_output", "logs": "/x/logs", "report": "report.html"}
+    rc_with = generate_report(
+        "perception", "t", [_pass_mr("latency_p95_ms", 40.0)], tmp_path / "a", th,
+        run_artifacts=artifacts,
+    )
+    rc_without = generate_report(
+        "perception", "t", [_pass_mr("latency_p95_ms", 40.0)], tmp_path / "b", th,
+    )
+    assert rc_with == rc_without == 0
+    assert (tmp_path / "a" / "report.html").read_text().strip() != ""
+    assert (tmp_path / "b" / "report.html").read_text().strip() != ""
+
+
+def test_metrics_json_schema_unchanged(tmp_path):
+    """The CONTRACT: metrics.json keeps EXACTLY its existing top-level keys plus
+    the new additive 'summary'/'run_artifacts'; pre-existing key TYPES are intact
+    (pass:bool, verdict in {PASS,FAIL,INVALID}, metrics:list of row dicts)."""
+    th = {"latency_p95_ms": ThresholdSpec(max=50.0, tolerance_band=5.0, tier="quality")}
+    generate_report("perception", "t", [_pass_mr("latency_p95_ms", 40.0)], tmp_path, th)
+    doc = json.loads((tmp_path / "metrics.json").read_text())
+    # Every pre-existing contract key still present:
+    for k in ("module", "run_id", "pass", "replay_faithfulness", "metrics", "verdict", "details"):
+        assert k in doc, f"contract key '{k}' missing"
+    # Only the additive keys joined the top level:
+    assert set(doc) - {
+        "module", "run_id", "pass", "replay_faithfulness", "metrics", "verdict", "details",
+    } <= {"summary", "run_artifacts", "overlap_pairs", "plots"}
+    # Types intact — the CI gate reads doc["pass"]/doc["verdict"]/the rows:
+    assert isinstance(doc["pass"], bool) and doc["pass"] is True
+    assert doc["verdict"] in {"PASS", "FAIL", "INVALID"}
+    assert isinstance(doc["metrics"], list)
+    row = next(m for m in doc["metrics"] if m["name"] == "latency_p95_ms")
+    assert row["value"] == 40.0 and row["passed"] is True and row["tier"] == "quality"
+
+
+def test_summary_block_built_from_rows(tmp_path):
+    """doc['summary'] is a list of cards each with label/value/status in
+    {PASS,BREACH,FAIL,NONE}, derived from the row's passed + tier; a validity-tier
+    breach yields BREACH, a failed quality row yields FAIL, passed:None -> NONE."""
+    th = {
+        "latency_p95_ms": ThresholdSpec(max=50.0, tier="quality"),         # will FAIL
+        "depth_validity": ThresholdSpec(min=0.5, tier="quality"),          # will PASS
+        "replay_max_gap_ms": ThresholdSpec(max=200.0, tier="validity"),
+        "replay_breach_count": ThresholdSpec(max=0, tier="validity"),      # will BREACH
+        "segmentation_coverage": ThresholdSpec(tier="quality"),            # no bound -> NONE
+    }
+    results = [
+        _mr("latency_p95_ms", 60.0),       # passed False, quality -> FAIL
+        _pass_mr("depth_validity", 0.9),   # passed True -> PASS
+        MetricResult(name="segmentation_coverage", module="perception",
+                     value={"segmentation_coverage": 0.4}, passed=True, is_regression=False),
+    ]
+    generate_report(
+        "perception", "t", results, tmp_path, th,
+        faithfulness={"max_gap_ms": 100.0, "breach_count": 1, "drop_rate": 0.0},
+    )
+    doc = json.loads((tmp_path / "metrics.json").read_text())
+    summary = doc["summary"]
+    assert isinstance(summary, list) and summary
+    for card in summary:
+        assert {"label", "value", "status"} <= set(card)
+        assert card["status"] in {"PASS", "BREACH", "FAIL", "NONE"}
+    statuses = {c["label"]: c["status"] for c in summary}
+    # A failed quality row -> FAIL; a passed row -> PASS.
+    assert any(s == "FAIL" for s in statuses.values())
+    assert any(s == "PASS" for s in statuses.values())
+    # The breach_count validity card (max 0, value 1) reads BREACH.
+    assert any(c["status"] == "BREACH" for c in summary)
+
+
+def test_report_html_renders_summary_and_debug(tmp_path):
+    """The rendered report.html carries the summary card markup (metric-grid) AND a
+    Debug section containing each run_artifacts value; autoescape stays ON so a
+    '<script>'-bearing metric name is escaped (T-07-01 preserved)."""
+    th = {"<script>alert(1)</script>": ThresholdSpec(max=50.0, tier="quality")}
+    artifacts = {
+        "bag": "/runs/42/replay_output",
+        "logs": "/runs/42/logs",
+        "report": "report.html",
+    }
+    generate_report(
+        "perception", "t",
+        [_mr("<script>alert(1)</script>", 10.0)],
+        tmp_path, th, run_artifacts=artifacts,
+    )
+    html = (tmp_path / "report.html").read_text()
+    # Summary card grid present.
+    assert "metric-grid" in html
+    # Debug section renders each run_artifacts value.
+    assert "/runs/42/replay_output" in html
+    assert "/runs/42/logs" in html
+    # Autoescape ON — the raw <script> tag never appears unescaped.
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html

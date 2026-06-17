@@ -73,6 +73,7 @@ def _run_metrics_pipeline(
     output_dir: Path,
     baseline: Optional[Path] = None,
     configs_dir: Path = DEFAULT_CONFIGS_DIR,
+    run_artifacts: Optional[dict] = None,
 ) -> int:
     """Run the registered perception plugins + faithfulness over an output bag,
     generate the report, and return the B9 exit code.
@@ -144,14 +145,33 @@ def _run_metrics_pipeline(
         )
 
     reports_dir = output_dir / "reports"
-    rc = generate_report(
+    # Debug-section pointer map (01-16's run_artifacts): the bag, the persisted
+    # run logs (<output>/logs/, written by runner.py 01-17), and the report
+    # itself. Default it from output_dir so the standalone `metrics` subcommand
+    # also gets a logs pointer; all_cmd passes the real result.logs_dir.
+    if run_artifacts is None:
+        run_artifacts = {
+            "bag": str(bag_path),
+            "logs": str(output_dir / "logs"),
+            "report": "report.html",
+        }
+    report_kwargs = dict(
         module=module_spec.name,
         run_id=str(output_dir.name),
         metric_results=results,
         output_dir=reports_dir,
         thresholds=module_spec.thresholds,
         faithfulness=faithfulness,
+        run_artifacts=run_artifacts,
     )
+    try:
+        rc = generate_report(**report_kwargs)
+    except TypeError:
+        # Graceful degrade: an older generate_report that predates the additive
+        # run_artifacts param (01-16). Drop it and render without the Debug
+        # pointer map rather than crash the run.
+        report_kwargs.pop("run_artifacts", None)
+        rc = generate_report(**report_kwargs)
     click.echo(f"Metrics report: {reports_dir / 'report.html'}")
     click.echo(f"Verdict: {_VERDICT_LABELS[rc]}")
     return rc
@@ -277,6 +297,8 @@ def run(module: str, bag_path: Path, output_dir: Path, configs_dir: Path) -> Non
     result = run_replay(module=module_spec, data=data_ref, output_dir=output_dir)
     click.echo(f"Output bag: {result.output_bag_path}")
     click.echo(f"Exit code: {result.exit_code}")
+    if result.logs_dir is not None:
+        click.echo(f"Logs: {result.logs_dir}")
 
 
 @main.command("all")
@@ -359,6 +381,11 @@ def all_cmd(
 
     result = run_replay(module=module_spec, data=data_ref, output_dir=output_dir)
     click.echo(f"Output bag: {result.output_bag_path}")
+    # The run logs (recorder.log + module.log) are persisted to <output>/logs/ by
+    # the runner (01-17). Surface the path on success so the dev (and 01-18's CI
+    # upload) can find them.
+    if result.logs_dir is not None:
+        click.echo(f"Logs: {result.logs_dir}")
     if result.exit_code != 0:
         # EXIT-CODE CONTRACT (SYSTEM-DESIGN-HLD-LLD B9): the process exit code is
         # the CI signal. 1 and 2 are RESERVED for the metrics verdict (quality
@@ -369,12 +396,26 @@ def all_cmd(
             "— exiting 3 (setup/replay error)",
             err=True,
         )
+        # B1 HEADLINE ASK (GAP c): the failure branch is EXACTLY where the logs
+        # are the evidence — point the developer at them before exiting 3.
+        if result.logs_dir is not None:
+            click.echo(f"Replay logs: {result.logs_dir}", err=True)
         sys.exit(3)
 
     if run_metrics:
+        # Thread the persisted logs into the report's Debug section (01-16
+        # run_artifacts). Build it here from the real result.logs_dir so the
+        # report's pointer map reflects this run's actual logs location.
+        run_artifacts = {
+            "bag": str(result.output_bag_path),
+            "logs": str(result.logs_dir) if result.logs_dir is not None
+            else str(output_dir / "logs"),
+            "report": "report.html",
+        }
         rc = _run_metrics_pipeline(
             module_spec, result.output_bag_path, output_dir,
             baseline=baseline, configs_dir=configs_dir,
+            run_artifacts=run_artifacts,
         )
         if rc != 0:
             sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
@@ -382,6 +423,8 @@ def all_cmd(
         # Scope-honest deferral (UAT gap 7): SC1 advertises --run-viz, but the
         # CI gate reads metrics.json (not images), so the developer visualizations
         # are deferred to a later phase rather than shipped as a silent no-op.
+        # NOTE: --run-viz becomes the Tier-3 local-viz entry point in a later
+        # phase (out of scope for 01-17 — this plan only persists+surfaces logs).
         click.echo(
             "--run-viz: visualization is deferred to a later phase "
             "(the CI gate reads metrics.json, not images)."

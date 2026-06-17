@@ -45,6 +45,81 @@ def evaluate_threshold(value: float, threshold) -> bool:
     return True
 
 
+# Human-readable card labels for the summary grid. Falls back to the raw row
+# name (autoescaped at render) for any metric not listed here.
+_SUMMARY_LABELS = {
+    "latency_p95_ms": "p95 Inference Latency",
+    "pipeline_throughput_hz": "Pipeline Throughput",
+    "depth_validity": "Depth Validity",
+    "segmentation_coverage": "Segmentation Coverage",
+    "cross_camera_overlap_iou": "Cross-Camera Overlap",
+    "mask_iou_vs_golden": "Mask IoU vs Golden",
+    "replay_max_gap_ms": "Max Replay Gap",
+    "replay_drop_rate": "Replay Drop Rate",
+    "replay_breach_count": "Replay Breaches",
+    "max_gap_ms": "Max Replay Gap (ms)",
+    "drop_rate": "Replay Drop Rate",
+    "breach_count": "Replay Breaches",
+}
+
+
+def _card_status(passed: Optional[bool], tier: str) -> str:
+    """Map a row's (passed, tier) to a summary-card badge status.
+
+    Mirrors the badge semantics the template renders:
+      passed is True                 -> "PASS"
+      passed is False & validity     -> "BREACH"  (B9 INVALID-flavoured)
+      passed is False & quality      -> "FAIL"
+      passed is None                 -> "NONE"    (skipped / no-threshold)
+    """
+    if passed is True:
+        return "PASS"
+    if passed is False:
+        return "BREACH" if tier == "validity" else "FAIL"
+    return "NONE"
+
+
+def _build_summary(
+    rows: list[dict],
+    faithfulness: Optional[dict],
+    breached_faith_fields: Optional[set] = None,
+) -> list[dict]:
+    """Derive the summary-card list from the evaluated metric rows + faithfulness.
+
+    Building this in the generator (not the template) keeps the template
+    logic-light and the card semantics unit-testable without rendering HTML.
+    Each card = {"label", "value", "status"} where status is from ``_card_status``.
+    Faithfulness headline cards (max_gap_ms, drop_rate, breach_count) are appended
+    when a faithfulness dict is present; a card reads BREACH when its matching
+    validity threshold breached this run (``breached_faith_fields`` carries the
+    faithfulness field names whose validity gate failed — note an EVALUATED
+    validity breach produces no metrics row, so the rows alone cannot reveal it).
+    """
+    breached_faith_fields = breached_faith_fields or set()
+    summary: list[dict] = []
+    for r in rows:
+        summary.append(
+            {
+                "label": _SUMMARY_LABELS.get(r["name"], r["name"]),
+                "value": r.get("value"),
+                "status": _card_status(r.get("passed"), r.get("tier", "quality")),
+            }
+        )
+    if faithfulness is not None:
+        # Headline faithfulness cards (always shown when faithfulness ran).
+        for fkey in ("max_gap_ms", "drop_rate", "breach_count"):
+            if fkey not in faithfulness:
+                continue
+            summary.append(
+                {
+                    "label": _SUMMARY_LABELS.get(fkey, fkey),
+                    "value": faithfulness[fkey],
+                    "status": "BREACH" if fkey in breached_faith_fields else "PASS",
+                }
+            )
+    return summary
+
+
 def generate_report(
     module: str,
     run_id: str,
@@ -52,10 +127,16 @@ def generate_report(
     output_dir: Path,
     thresholds: dict,
     faithfulness: Optional[dict] = None,
+    run_artifacts: Optional[dict] = None,
 ) -> int:
     """Evaluate metrics vs thresholds, AND-gate quality, write artifacts, return the B9 exit code.
 
     See module docstring for the exit-code contract.
+
+    ``run_artifacts`` (A3) is an optional ``{"bag": ..., "logs": ..., "report": ...}``
+    pointer map rendered into the report's Debug section. It is ADDITIVE: the CI
+    gate reads ``metrics.json`` (``doc["pass"]``/``doc["verdict"]``/the rows), never
+    ``run_artifacts``, so it cannot affect the verdict or the exit code.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,15 +152,20 @@ def generate_report(
     rows = []
     validity_pass = True
     faith_block = None
+    # Faithfulness fields whose validity threshold breached this run — used ONLY to
+    # badge the additive headline summary cards (BREACH vs PASS). Purely
+    # presentational; does not touch validity_pass or the exit code.
+    breached_faith_fields: set[str] = set()
     if faithfulness is not None:
         for tname, vt in thresholds.items():
             if getattr(vt, "tier", "quality") != "validity":
                 continue
             fkey = tname[len("replay_"):] if tname.startswith("replay_") else tname
             if fkey in faithfulness:
-                validity_pass = validity_pass and evaluate_threshold(
-                    float(faithfulness[fkey]), vt
-                )
+                field_ok = evaluate_threshold(float(faithfulness[fkey]), vt)
+                if not field_ok:
+                    breached_faith_fields.add(fkey)
+                validity_pass = validity_pass and field_ok
             else:
                 # WR-03 / T-07-02: a validity threshold that cannot be evaluated
                 # must NOT pass silently. Validity is the stronger gate (exit 2) —
@@ -169,6 +255,11 @@ def generate_report(
     else:
         details = "all configured criteria passed"
 
+    # ── Additive presentation layer (A1/A3) ────────────────────────────────
+    # These keys are NEW and never rename/remove a contract key. The CI gate
+    # reads doc["pass"]/doc["verdict"]/the rows; it ignores everything below.
+    summary = _build_summary(rows, faithfulness, breached_faith_fields)
+
     doc = {
         "module": module,
         "run_id": run_id,
@@ -177,6 +268,9 @@ def generate_report(
         "metrics": rows,
         "verdict": verdict,
         "details": details,
+        # additive:
+        "summary": summary,
+        "run_artifacts": run_artifacts,
     }
     # metrics.json is the machine-read gate signal (CI reads doc["pass"] / verdict).
     # json.dumps cannot be HTML-injected, so the values pass through untransformed.

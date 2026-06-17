@@ -163,6 +163,10 @@ def _run_metrics_pipeline(
         thresholds=module_spec.thresholds,
         faithfulness=faithfulness,
         run_artifacts=run_artifacts,
+        # Tier-2 plots are DEFAULT on every run (the agreed scope — the report is
+        # generated on every run anyway). Forwarding the reader is what triggers
+        # generate_report's plot rendering; without it the report has no plots.
+        reader=reader,
     )
     try:
         rc = generate_report(**report_kwargs)

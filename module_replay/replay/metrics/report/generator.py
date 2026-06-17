@@ -156,8 +156,10 @@ def generate_report(
     ``reader`` (A2) is an optional ``BagReader``: when given, the report's static
     matplotlib plots are generated from the metric rows + bag. Plot generation runs
     in a try/except that degrades to no plots on ANY failure — it never alters the
-    verdict or the exit code. When ``reader`` is None (the cheap CI metrics-gate
-    path / the pure-evaluator unit tests) no plots are generated.
+    verdict or the exit code. The CLI (_run_metrics_pipeline) ALWAYS forwards a
+    reader, so plots are DEFAULT on every run (incl. the CI metrics job) — the agreed
+    scope. ``reader`` is None only for the pure-evaluator unit tests (and a future
+    --no-plots / pure-gate mode), where no plots are generated.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

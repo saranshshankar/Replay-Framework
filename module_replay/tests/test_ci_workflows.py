@@ -222,3 +222,44 @@ def test_both_workflows_parse():
     """Block style preserved — a ${{ }} in a flow-mapping would break safe_load."""
     assert isinstance(_load(GATE), dict)
     assert isinstance(_load(NIGHTLY), dict)
+
+
+# --- README "Debugging a failed run" section (GAP e) ----------------------
+
+README = Path(__file__).resolve().parent.parent / "README.md"
+
+
+def _debug_section() -> str:
+    """The README text from the 'Debugging a failed run' heading onward."""
+    text = README.read_text()
+    marker = "Debugging a failed run"
+    assert marker in text, "README must have a 'Debugging a failed run' section"
+    return text[text.index(marker):]
+
+
+def test_readme_has_debug_section():
+    """The section names the three artifact locations after a run (bag/logs/report)."""
+    section = _debug_section()
+    assert "<output>/replay_output" in section, "must name the output bag location"
+    assert "<output>/logs/" in section, "must name the logs dir"
+    assert "recorder.log" in section and "module.log" in section, "must name both log files"
+    assert "<output>/reports/report.html" in section, "must name the report location"
+
+
+def test_readme_documents_ci_artifact_download():
+    """The section explains pulling the EPHEMERAL CI artifact from the Actions run."""
+    section = _debug_section().lower()
+    assert "artifact" in section, "must mention downloading the CI artifact"
+    assert (
+        "retention" in section or "5 day" in section or "few days" in section
+    ), "must convey the artifacts are ephemeral (~5 day retention)"
+
+
+def test_readme_notes_local_viz_followon():
+    """Scope honesty: local rich-viz (--run-viz) is a follow-on / deferred (Tier 3 out)."""
+    section = _debug_section()
+    lowered = section.lower()
+    assert "--run-viz" in section or "local" in lowered, "must reference the local-viz mode"
+    assert (
+        "follow-on" in lowered or "deferred" in lowered
+    ), "must note local rich-viz is a follow-on / deferred"

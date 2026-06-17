@@ -228,3 +228,101 @@ def test_report_html_renders_summary_and_debug(tmp_path):
     # Autoescape ON — the raw <script> tag never appears unescaped.
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+# ── 01-16 Task 3: wire plots into generator + render in template ──────────────
+
+
+def _overlap_mr(pairs):
+    return MetricResult(
+        name="cross_camera_overlap_iou",
+        module="perception",
+        value={
+            "cross_camera_overlap_iou": 0.78,
+            "num_pairs": len(pairs),
+            "feature_matcher": "akaze",
+            "pairs": pairs,
+        },
+        passed=True,
+        is_regression=False,
+    )
+
+
+def test_generate_report_invokes_plots_when_reader_given(tmp_path, mocker):
+    """generate_report given an optional reader calls generate_report_plots and
+    references the returned plot paths as <img src> in report.html."""
+    fake = {
+        "latency": tmp_path / "latency_time_series.png",
+        "pipeline": tmp_path / "pipeline_breakdown.png",
+    }
+    spy = mocker.patch(
+        "replay.metrics.report.generator.generate_report_plots", return_value=fake
+    )
+    th = {"latency_p95_ms": ThresholdSpec(max=50.0, tolerance_band=5.0, tier="quality")}
+    rc = generate_report(
+        "perception", "t", [_pass_mr("latency_p95_ms", 40.0)], tmp_path, th,
+        reader=object(),  # any non-None reader triggers the plot path
+    )
+    assert rc == 0
+    spy.assert_called_once()
+    html = (tmp_path / "report.html").read_text()
+    assert "latency_time_series.png" in html
+    assert "pipeline_breakdown.png" in html
+
+
+def test_generate_report_no_reader_no_plots_still_renders(tmp_path, mocker):
+    """WITHOUT a reader, generate_report renders the summary + tables, emits NO
+    plot imgs, never calls the plot generator, and returns the same exit code."""
+    spy = mocker.patch("replay.metrics.report.generator.generate_report_plots")
+    th = {"latency_p95_ms": ThresholdSpec(max=50.0, tolerance_band=5.0, tier="quality")}
+    rc = generate_report("perception", "t", [_pass_mr("latency_p95_ms", 40.0)], tmp_path, th)
+    assert rc == 0
+    spy.assert_not_called()
+    html = (tmp_path / "report.html").read_text()
+    assert "metric-grid" in html
+    assert ".png" not in html  # no plot images when no reader
+
+
+def test_plot_failure_does_not_change_verdict(tmp_path, mocker):
+    """A plot generator raising must NOT crash a run or flip the verdict —
+    report.html is still written and the B9 exit code is unchanged (graceful degrade)."""
+    mocker.patch(
+        "replay.metrics.report.generator.generate_report_plots",
+        side_effect=RuntimeError("matplotlib blew up"),
+    )
+    th = {"latency_p95_ms": ThresholdSpec(max=50.0, tolerance_band=5.0, tier="quality")}
+    rc = generate_report(
+        "perception", "t", [_pass_mr("latency_p95_ms", 40.0)], tmp_path, th,
+        reader=object(),
+    )
+    assert rc == 0  # verdict unchanged despite the plot exception
+    assert (tmp_path / "report.html").read_text().strip() != ""
+    doc = json.loads((tmp_path / "metrics.json").read_text())
+    assert doc["pass"] is True and doc["verdict"] == "PASS"
+
+
+def test_template_renders_cross_camera_pair_table(tmp_path):
+    """A cross_camera_overlap_iou row's value['pairs'] (LIVE cam0_cam1 key shape)
+    renders a per-pair table — one row per pair, with the pair key + its
+    mean/min agreement values present in report.html."""
+    pairs = {
+        "cam0_cam1": {
+            "description": "Front-Top<->Front-Bottom", "num_frames": 827,
+            "calibration_inliers": 136, "mean_agreement": 0.775,
+            "min_agreement": 0.565, "overlap_pixels": 1234,
+        },
+        "cam0_cam5": {
+            "description": "Front-Top<->Left", "num_frames": 640,
+            "calibration_inliers": 98, "mean_agreement": 0.812,
+            "min_agreement": 0.610, "overlap_pixels": 980,
+        },
+    }
+    th = {"cross_camera_overlap_iou": ThresholdSpec(min=0.75, tier="quality")}
+    generate_report("perception", "t", [_overlap_mr(pairs)], tmp_path, th)
+    html = (tmp_path / "report.html").read_text()
+    # Both pair keys appear (one row each).
+    assert "cam0_cam1" in html
+    assert "cam0_cam5" in html
+    # Their agreement values are rendered.
+    assert "0.775" in html and "0.565" in html
+    assert "0.812" in html and "0.61" in html  # 0.610 may render as 0.61

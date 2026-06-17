@@ -231,3 +231,93 @@ def test_build_replay_script_preserves_cleanup_invariant(tmp_path: Path, percept
     assert "setsid ros2 bag record" in script
     assert "setsid ros2 bag play" in script
     assert "wait $PLAY_PID" in script
+    # The in-container script still WRITES the logs to {log_dir}/recorder.log and
+    # {log_dir}/module.log — 01-17 only COPIES them out on the host afterwards, it
+    # must NOT change where the script writes them.
+    assert "recorder.log" in script
+    assert "module.log" in script
+
+
+# ── 01-17: logs persisted to <output>/logs/ (host-side copy after exec) ──────
+
+
+def _patch_runner_io(tmp_path: Path, mocker, exit_code: int = 0):
+    """Stage a bag outside the library and patch the runner's host-side IO.
+
+    Returns the patched ``shutil.copy`` mock so log-copy targets can be asserted.
+    Unlike ``_run_and_capture_script`` this returns the copy mock (the log-copy
+    seam) rather than the generated script.
+    """
+    mocker.patch("replay.runner.paths.HOST_BAG_LIBRARY", tmp_path / "elsewhere")
+    data_ref = _staged_bag(tmp_path)
+    mocker.patch("replay.runner.exec_in_container", return_value=exit_code)
+    mocker.patch("replay.runner.shutil.move")
+    mocker.patch("replay.runner.shutil.copytree")
+    copy_mock = mocker.patch("replay.runner.shutil.copy")
+    return data_ref, copy_mock
+
+
+def test_run_replay_copies_logs_to_output(tmp_path: Path, perception_spec, mocker):
+    """GAP c: after a run, RunResult.logs_dir == <output>/logs and BOTH
+    recorder.log + module.log are copied from HOST_REPLAY_WORKDIR into it."""
+    from replay import paths
+
+    work_host = tmp_path / "work"
+    mocker.patch("replay.runner.paths.HOST_REPLAY_WORKDIR", work_host)
+    data_ref, copy_mock = _patch_runner_io(tmp_path, mocker, exit_code=0)
+
+    output_dir = tmp_path / "out"
+    result = run_replay(module=perception_spec, data=data_ref, output_dir=output_dir)
+
+    logs_dir = output_dir / "logs"
+    assert result.logs_dir == logs_dir
+    # Both logs copied FROM the host workdir TO <output>/logs/.
+    copy_targets = {Path(call.args[1]) for call in copy_mock.call_args_list}
+    copy_sources = {Path(call.args[0]) for call in copy_mock.call_args_list}
+    assert logs_dir / "recorder.log" in copy_targets
+    assert logs_dir / "module.log" in copy_targets
+    assert work_host / "recorder.log" in copy_sources
+    assert work_host / "module.log" in copy_sources
+
+
+def test_run_replay_copies_logs_even_on_failure(tmp_path: Path, perception_spec, mocker):
+    """The logs are the failure evidence: on a non-zero container exit (137) the
+    exit code is still propagated AND logs_dir is set AND the copy still happened."""
+    work_host = tmp_path / "work"
+    mocker.patch("replay.runner.paths.HOST_REPLAY_WORKDIR", work_host)
+    data_ref, copy_mock = _patch_runner_io(tmp_path, mocker, exit_code=137)
+
+    output_dir = tmp_path / "out"
+    result = run_replay(module=perception_spec, data=data_ref, output_dir=output_dir)
+
+    assert result.exit_code == 137
+    assert result.logs_dir == output_dir / "logs"
+    targets = {Path(call.args[1]).name for call in copy_mock.call_args_list}
+    assert {"recorder.log", "module.log"} <= targets
+
+
+def test_run_replay_log_copy_is_failsafe(tmp_path: Path, perception_spec, mocker):
+    """A missing/unreadable log must NOT crash the run or change the exit code:
+    if the log copy raises FileNotFoundError, run_replay still returns a RunResult
+    with the original exit code."""
+    work_host = tmp_path / "work"
+    mocker.patch("replay.runner.paths.HOST_REPLAY_WORKDIR", work_host)
+    data_ref = _staged_bag(tmp_path)
+    mocker.patch("replay.runner.exec_in_container", return_value=137)
+    mocker.patch("replay.runner.shutil.move")
+    mocker.patch("replay.runner.shutil.copytree")
+    # The log copy raises (source log never produced). QoS staging also routes
+    # through shutil.copy, so we raise only for the log filenames and pass through
+    # otherwise — the run must survive a log that does not exist.
+    def _copy(src, dst, *a, **k):
+        if Path(src).name in {"recorder.log", "module.log"}:
+            raise FileNotFoundError(src)
+        return dst
+    mocker.patch("replay.runner.shutil.copy", side_effect=_copy)
+
+    output_dir = tmp_path / "out"
+    result = run_replay(module=perception_spec, data=data_ref, output_dir=output_dir)
+
+    # No raise; original exit code preserved; logs_dir still reported.
+    assert result.exit_code == 137
+    assert result.logs_dir == output_dir / "logs"

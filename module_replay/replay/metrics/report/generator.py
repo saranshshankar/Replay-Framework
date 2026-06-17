@@ -22,10 +22,24 @@ with no teeth can never silently pass (RESEARCH Pitfall 7 / threat T-07-02).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
 from replay.metrics.base import MetricResult
+
+logger = logging.getLogger(__name__)
+
+# Bound at module level so report tests can ``mocker.patch`` it on this module and
+# so the name always exists even when matplotlib is absent (the cheap CI
+# metrics-gate path never imports it). It is only CALLED when a reader is
+# explicitly passed to generate_report, always inside a try/except that degrades
+# to no plots — a plot failure (or a missing matplotlib) can never crash a run or
+# flip the B9 verdict (T-16-02).
+try:
+    from replay.metrics.report.plots import generate_report_plots
+except Exception:  # pragma: no cover - matplotlib optional on the metrics-only path
+    generate_report_plots = None  # type: ignore[assignment]
 
 
 def evaluate_threshold(value: float, threshold) -> bool:
@@ -128,6 +142,7 @@ def generate_report(
     thresholds: dict,
     faithfulness: Optional[dict] = None,
     run_artifacts: Optional[dict] = None,
+    reader=None,
 ) -> int:
     """Evaluate metrics vs thresholds, AND-gate quality, write artifacts, return the B9 exit code.
 
@@ -137,6 +152,12 @@ def generate_report(
     pointer map rendered into the report's Debug section. It is ADDITIVE: the CI
     gate reads ``metrics.json`` (``doc["pass"]``/``doc["verdict"]``/the rows), never
     ``run_artifacts``, so it cannot affect the verdict or the exit code.
+
+    ``reader`` (A2) is an optional ``BagReader``: when given, the report's static
+    matplotlib plots are generated from the metric rows + bag. Plot generation runs
+    in a try/except that degrades to no plots on ANY failure — it never alters the
+    verdict or the exit code. When ``reader`` is None (the cheap CI metrics-gate
+    path / the pure-evaluator unit tests) no plots are generated.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -260,6 +281,16 @@ def generate_report(
     # reads doc["pass"]/doc["verdict"]/the rows; it ignores everything below.
     summary = _build_summary(rows, faithfulness, breached_faith_fields)
 
+    # A1: surface the cross-camera overlap plugin's per-pair dict (the richer
+    # value['pairs']) onto the doc so the template can render the per-camera-pair
+    # table while staying logic-light. The metric row only carries the headline
+    # scalar; the per-pair detail comes through here. Additive — not in the gate.
+    overlap_pairs = None
+    for r in metric_results:
+        if r.name == "cross_camera_overlap_iou" and isinstance(r.value, dict):
+            overlap_pairs = r.value.get("pairs")
+            break
+
     doc = {
         "module": module,
         "run_id": run_id,
@@ -271,10 +302,30 @@ def generate_report(
         # additive:
         "summary": summary,
         "run_artifacts": run_artifacts,
+        "overlap_pairs": overlap_pairs,
     }
     # metrics.json is the machine-read gate signal (CI reads doc["pass"] / verdict).
     # json.dumps cannot be HTML-injected, so the values pass through untransformed.
     (output_dir / "metrics.json").write_text(json.dumps(doc, indent=2))
+
+    # ── A2: static plots (only when a reader is explicitly passed) ──────────
+    # Generated inside a try/except that degrades to {} on ANY failure (incl. a
+    # missing matplotlib) — plot generation must NEVER crash a run or flip the
+    # verdict (T-16-02). Paths are made report-relative for the <img src> refs
+    # (adapts the PoC _make_relative).
+    plots: dict[str, str] = {}
+    if reader is not None and generate_report_plots is not None:
+        try:
+            raw_plots = generate_report_plots(metric_results, reader, output_dir)
+            for name, p in (raw_plots or {}).items():
+                p = Path(p)
+                try:
+                    plots[name] = str(p.relative_to(output_dir))
+                except ValueError:
+                    plots[name] = str(p)
+        except Exception:
+            logger.warning("plot generation failed; rendering report without plots", exc_info=True)
+            plots = {}
 
     # report.html — rendered with autoescape ON (threat T-07-01) so a crafted
     # topic/metric name string can never inject markup into the artifact.
@@ -284,7 +335,7 @@ def generate_report(
         loader=FileSystemLoader(str(Path(__file__).parent)),
         autoescape=select_autoescape(["html"]),
     )
-    html = env.get_template("template.html").render(doc=doc)
+    html = env.get_template("template.html").render(doc=doc, plots=plots)
     (output_dir / "report.html").write_text(html)
 
     # B9: INVALID RUN (2) beats FAIL (1) — infra noise must never read as a code regression.

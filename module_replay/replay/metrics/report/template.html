@@ -1,46 +1,179 @@
 <!doctype html>
-<html>
-<head><meta charset="utf-8"><title>{{ doc.module }} replay report</title></head>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ doc.module }} replay report — {{ doc.verdict }}</title>
+<style>
+  /* Presentation adapted from the PoC report (style only; data is OUR metrics.json). */
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: #f5f5f5; color: #333; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { color: #1a237e; border-bottom: 3px solid #1a237e; padding-bottom: 10px; }
+  h2 { color: #283593; margin-top: 30px; border-bottom: 1px solid #ccc; padding-bottom: 5px; }
+  h3 { color: #3949ab; }
+  .card { background: white; border-radius: 8px; padding: 20px; margin: 15px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+  .verdict-pass { color: #2e7d32; }
+  .verdict-fail { color: #c62828; }
+  .verdict-invalid { color: #f57f17; }
+  .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+  .metric-box { background: #e8eaf6; border-radius: 6px; padding: 15px; text-align: center; }
+  .metric-value { font-size: 28px; font-weight: bold; color: #1a237e; word-break: break-word; }
+  .metric-label { font-size: 12px; color: #666; margin: 5px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+  th { background: #e8eaf6; padding: 10px; text-align: left; font-size: 13px; }
+  td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; }
+  tr:hover { background: #f5f5f5; }
+  .img-container { text-align: center; margin: 15px 0; }
+  .img-container img { max-width: 100%; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+  .badge-ok { background: #c8e6c9; color: #2e7d32; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .badge-warn { background: #fff9c4; color: #f57f17; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .badge-fail { background: #ffcdd2; color: #c62828; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .badge-none { background: #eceff1; color: #607d8b; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .section-note { font-style: italic; color: #666; font-size: 13px; margin: 5px 0 15px; }
+  code { background: #eceff1; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
 <body>
-<h1>{{ doc.module }} — {{ doc.verdict }}</h1>
-<p>run: {{ doc.run_id }} · pass: {{ doc.pass }}</p>
-{% if doc.details %}<p>{{ doc.details }}</p>{% endif %}
+<div class="container">
+
+<h1>{{ doc.module }} replay report —
+  {% if doc.verdict == "PASS" %}<span class="verdict-pass">PASS</span>
+  {% elif doc.verdict == "INVALID" %}<span class="verdict-invalid">INVALID</span>
+  {% else %}<span class="verdict-fail">FAIL</span>{% endif %}
+</h1>
+<p>run: <code>{{ doc.run_id }}</code> · pass: {{ doc.pass }}</p>
+{% if doc.details %}<p class="section-note">{{ doc.details }}</p>{% endif %}
+
+<!-- Summary cards (A1) -->
 {% if doc.summary %}
-<h2>Summary</h2>
-<div class="metric-grid">
-{% for card in doc.summary %}
-  <div class="metric-box">
-    <div class="metric-value">{{ card.value }}</div>
-    <div class="metric-label">{{ card.label }}</div>
-    {% if card.status == "PASS" %}<span class="badge-ok">PASS</span>
-    {% elif card.status == "BREACH" %}<span class="badge-warn">BREACH</span>
-    {% elif card.status == "FAIL" %}<span class="badge-fail">FAIL</span>
-    {% else %}<span class="badge-none">—</span>{% endif %}
+<div class="card">
+  <h2>Summary</h2>
+  <div class="metric-grid">
+  {% for card in doc.summary %}
+    <div class="metric-box">
+      <div class="metric-value">{{ card.value if card.value is not none else "—" }}</div>
+      <div class="metric-label">{{ card.label }}</div>
+      {% if card.status == "PASS" %}<span class="badge-ok">PASS</span>
+      {% elif card.status == "BREACH" %}<span class="badge-warn">BREACH</span>
+      {% elif card.status == "FAIL" %}<span class="badge-fail">FAIL</span>
+      {% else %}<span class="badge-none">n/a</span>{% endif %}
+    </div>
+  {% endfor %}
   </div>
-{% endfor %}
 </div>
 {% endif %}
+
+<!-- Replay faithfulness (validity tier) -->
 {% if doc.replay_faithfulness %}
-<h2>Replay faithfulness ({{ doc.replay_faithfulness.verdict }})</h2>
-<p>max_gap_ms={{ doc.replay_faithfulness.max_gap_ms }}
-   breach_count={{ doc.replay_faithfulness.breach_count }}
-   drop_rate={{ doc.replay_faithfulness.drop_rate }}</p>
+<div class="card">
+  <h2>Replay Faithfulness
+    {% if doc.replay_faithfulness.verdict == "pass" %}<span class="badge-ok">PASS</span>
+    {% else %}<span class="badge-warn">FAIL</span>{% endif %}
+  </h2>
+  <table>
+    <tr><th>Field</th><th>Value</th></tr>
+    <tr><td>max_gap_ms</td><td>{{ doc.replay_faithfulness.max_gap_ms }}</td></tr>
+    <tr><td>breach_count</td><td>{{ doc.replay_faithfulness.breach_count }}</td></tr>
+    <tr><td>drop_rate</td><td>{{ doc.replay_faithfulness.drop_rate }}</td></tr>
+  </table>
+</div>
 {% endif %}
-<table border="1">
-<tr><th>metric</th><th>value</th><th>passed</th><th>tier</th><th>provisional</th><th>note</th></tr>
-{% for m in doc.metrics %}
-<tr><td>{{ m.name }}</td><td>{{ m.value }}</td><td>{{ m.passed }}</td><td>{{ m.tier }}</td><td>{{ m.provisional }}</td><td>{{ m.note if m.note else "" }}</td></tr>
-{% endfor %}
-</table>
+
+<!-- Per-metric table (the CI-row view) -->
+<div class="card">
+  <h2>Metrics</h2>
+  <table>
+    <tr><th>metric</th><th>value</th><th>passed</th><th>tier</th><th>provisional</th><th>note</th></tr>
+    {% for m in doc.metrics %}
+    <tr>
+      <td>{{ m.name }}</td>
+      <td>{{ m.value if m.value is not none else "—" }}</td>
+      <td>
+        {% if m.passed is true %}<span class="badge-ok">PASS</span>
+        {% elif m.passed is false and m.tier == "validity" %}<span class="badge-warn">BREACH</span>
+        {% elif m.passed is false %}<span class="badge-fail">FAIL</span>
+        {% else %}<span class="badge-none">n/a</span>{% endif %}
+      </td>
+      <td>{{ m.tier }}</td>
+      <td>{{ m.provisional }}</td>
+      <td>{{ m.note if m.note else "" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<!-- Inference latency plot (A2) -->
+{% if plots and plots.latency %}
+<div class="card">
+  <h2>Inference Latency (seg_argmax)</h2>
+  <p class="section-note">Aggregate seg_argmax compute time vs the configured threshold.</p>
+  <div class="img-container"><img src="{{ plots.latency }}" alt="Inference Latency"></div>
+</div>
+{% endif %}
+
+<!-- Pipeline throughput plot (A2) -->
+{% if plots and plots.pipeline %}
+<div class="card">
+  <h2>Pipeline Throughput</h2>
+  <p class="section-note">Effective publish rate per output topic.</p>
+  <div class="img-container"><img src="{{ plots.pipeline }}" alt="Pipeline Throughput"></div>
+</div>
+{% endif %}
+
+<!-- Cross-camera overlap per-pair table (A1) -->
+{% if doc.overlap_pairs %}
+<div class="card">
+  <h2>Cross-Camera Overlap Consistency</h2>
+  <p class="section-note">Pixel-wise semantic agreement in feature-matched overlap regions (threshold 0.75).</p>
+  <table>
+    <tr><th>Camera Pair</th><th>Description</th><th>Frames</th><th>Mean Agreement</th><th>Min Agreement</th><th>Status</th></tr>
+    {% for pair_key, pair in doc.overlap_pairs.items() %}
+    <tr>
+      <td>{{ pair_key }}</td>
+      <td>{{ pair.description }}</td>
+      <td>{{ pair.num_frames }}</td>
+      <td>{{ pair.mean_agreement }}</td>
+      <td>{{ pair.min_agreement }}</td>
+      <td>
+        {% if pair.mean_agreement is not none and pair.mean_agreement >= 0.75 %}
+          <span class="badge-ok">PASS</span>
+        {% else %}
+          <span class="badge-fail">BELOW</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<!-- Depth heatmaps (A2) -->
+{% if plots and plots.depth %}
+<div class="card">
+  <h2>Depth Heatmaps</h2>
+  <p class="section-note">Per-frame depth (turbo colormap) for the depth_raw_sim cameras. See <code>depth_heatmaps/</code> for the full montage.</p>
+  <div class="img-container"><img src="{{ plots.depth }}" alt="Depth Heatmap"></div>
+</div>
+{% endif %}
+
+<!-- Debug section (A3) -->
 {% if doc.run_artifacts %}
-<h2>Debug</h2>
-<p class="section-note">Where to pull this run's data and logs to debug locally.</p>
-<table border="1">
-<tr><th>artifact</th><th>location</th></tr>
-{% for key, loc in doc.run_artifacts.items() %}
-<tr><td>{{ key }}</td><td>{{ loc }}</td></tr>
-{% endfor %}
-</table>
+<div class="card">
+  <h2>Debug</h2>
+  <p class="section-note">Where to pull this run's data and logs to debug locally (on-disk paths locally; artifact URLs in CI).</p>
+  <table>
+    <tr><th>artifact</th><th>location</th></tr>
+    {% for key, loc in doc.run_artifacts.items() %}
+    <tr><td>{{ key }}</td><td><code>{{ loc }}</code></td></tr>
+    {% endfor %}
+  </table>
+</div>
 {% endif %}
+
+<div class="card" style="text-align: center; color: #999; font-size: 12px;">
+  Generated by the Module-wise Replay metrics gate
+</div>
+
+</div>
 </body>
 </html>

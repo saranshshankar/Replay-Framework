@@ -24,7 +24,11 @@ metrics = [
     "rosbags>=0.11.3",
     "numpy>=2.0,<3",
     "opencv-python-headless>=4.10,<5",
+    # matplotlib (Agg) backs the static report plots (01-16 / A2): latency,
+    # pipeline-throughput, and depth heatmaps. Offline pure-Python, no GPU.
     "matplotlib>=3.9,<4",
+    # bokeh is reserved for the DEFERRED Tier 3 local interactive viz — NOT used
+    # by the 01-16 report (which adds no GPU/torch dep).
     "bokeh>=3.6,<4",
     "Jinja2>=3.1",
 ]

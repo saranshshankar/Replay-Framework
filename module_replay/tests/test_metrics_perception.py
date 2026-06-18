@@ -92,6 +92,67 @@ def test_latency_gate_enforces_end_to_end(diagnostics_bag, tmp_path):
     assert _run([40.0, 42.0, 44.0, 45.0], "pass_run") == 0
 
 
+# ── BUG 3: configurable diagnostics stage via cfg['latency_stage'] ──────────────
+# 01-19 set perception.yaml latency_stage=inference_seg_extract_segmentation (the
+# live op after the seg_argmax->seg_extract rename). The hardcoded seg_argmax
+# parsed NOTHING on the real bag -> latency_p95_ms null in the e2e. These tests
+# pin the configurable stage, the seg_argmax back-compat default, and a
+# conservative substring fallback.
+STAGE_LIVE = "inference_seg_extract_segmentation"
+
+
+def test_latency_reads_configured_stage(diagnostics_bag):
+    """BUG 3: with cfg latency_stage=inference_seg_extract_segmentation and a
+    diagnostics bag whose stage is that live op, latency_p95_ms is POPULATED (not
+    None). Hardcoded seg_argmax would have found nothing -> None (the e2e bug)."""
+    from replay.metrics.perception.latency import LatencyMetric
+
+    avg_values = [40.0, 42.0, 45.0, 60.0]
+    bag = diagnostics_bag(avg_values, stage_name=STAGE_LIVE, name="livestage")
+    reader = BagReader(bag, [DIAG])
+    cfg = {"diagnostics_topic": DIAG, "latency_stage": STAGE_LIVE}
+    out = LatencyMetric().compute(reader, cfg)
+    json.dumps(out)
+    expected_p95 = round(float(np.percentile(np.array(avg_values), 95)), 3)
+    assert out["latency_p95_ms"] == expected_p95
+    assert out["latency_p95_ms"] is not None
+    assert out.get("skipped") is not True
+    assert out["num_windows"] == 4
+
+
+def test_latency_default_stage_is_seg_argmax(diagnostics_bag):
+    """Back-compat: omitting latency_stage falls back to the seg_argmax default,
+    so a seg_argmax diagnostics bag still parses (preserves 01-13 behavior)."""
+    from replay.metrics.perception.latency import LatencyMetric
+
+    avg_values = [40.0, 42.0, 45.0, 60.0]
+    bag = diagnostics_bag(avg_values, name="defaultstage")  # default stage_name="seg_argmax"
+    reader = BagReader(bag, [DIAG])
+    out = LatencyMetric().compute(reader, {"diagnostics_topic": DIAG})  # NO latency_stage
+    json.dumps(out)
+    expected_p95 = round(float(np.percentile(np.array(avg_values), 95)), 3)
+    assert out["latency_p95_ms"] == expected_p95
+    assert out.get("skipped") is not True
+
+
+def test_latency_substring_fallback(diagnostics_bag):
+    """Conservative substring fallback: when the configured latency_stage is a
+    substring of the bag's actual stage name (e.g. 'seg_extract' vs the live
+    'inference_seg_extract_segmentation'), the exact match misses but the
+    substring fallback still finds the avg_compute_ms values."""
+    from replay.metrics.perception.latency import LatencyMetric
+
+    avg_values = [40.0, 42.0, 45.0, 60.0]
+    bag = diagnostics_bag(avg_values, stage_name=STAGE_LIVE, name="substringstage")
+    reader = BagReader(bag, [DIAG])
+    cfg = {"diagnostics_topic": DIAG, "latency_stage": "seg_extract"}
+    out = LatencyMetric().compute(reader, cfg)
+    json.dumps(out)
+    expected_p95 = round(float(np.percentile(np.array(avg_values), 95)), 3)
+    assert out["latency_p95_ms"] == expected_p95
+    assert out.get("skipped") is not True
+
+
 def test_intrinsic_metrics_json_serializable(synthetic_bag):
     """MTRC-02: pipeline/segmentation/depth return JSON-serializable dicts."""
     from replay.metrics.perception.pipeline import PipelineMetric

@@ -47,6 +47,9 @@ class ModuleSpec:
     expected_hz: dict = field(default_factory=dict)  # topic-substring -> expected publish Hz
     depth_topics: list = field(default_factory=list)  # depth output topics for DepthMetric
     diagnostics_topic: Optional[str] = None           # perception diagnostics topic for LatencyMetric
+    # Gap-closure (01-19): per-topic breach tolerance + the diagnostics stage LatencyMetric reads.
+    gap_tolerance: dict = field(default_factory=dict)  # topic-substring -> breach gap factor (default 2.0)
+    latency_stage: Optional[str] = None               # diagnostics stage name LatencyMetric parses
 
 
 def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
@@ -91,6 +94,13 @@ def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
     depth_topics = list(data.get("depth_topics") or [])
     diagnostics_topic = data.get("diagnostics_topic")
 
+    # Gap-closure (01-19): per-topic gap_tolerance map + scalar latency_stage. Both
+    # optional (defaulted) so 6-field callers are unaffected; values are not coerced
+    # here — the consuming faithfulness/latency code does the substring-match lookup
+    # (the expected_hz precedent: yaml already yields floats/strings).
+    gap_tolerance = data.get("gap_tolerance") or {}
+    latency_stage = data.get("latency_stage")
+
     return ModuleSpec(
         name=data["name"],
         container=container,
@@ -106,6 +116,8 @@ def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
         expected_hz=expected_hz,
         depth_topics=depth_topics,
         diagnostics_topic=diagnostics_topic,
+        gap_tolerance=gap_tolerance,
+        latency_stage=latency_stage,
     )
 
 

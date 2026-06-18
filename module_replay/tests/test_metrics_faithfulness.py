@@ -48,6 +48,48 @@ def _hz_stamps(hz: float, span_s: float, start_ns: int = 0) -> list[int]:
     return [start_ns + i * period_ns for i in range(n)]
 
 
+def _write_simtime_bag(bag_dir: Path, topic_specs: list[tuple[str, float, float, float]]) -> Path:
+    """Write a bag where the BAG-WRITE clock and the HEADER (robot) clock are DECOUPLED.
+
+    This reproduces the e2e's defining shape (BUG 1): ``ros2 bag record`` stamps each
+    message with the wall-clock write time (a slow ~99s span), while every message's
+    ``header.stamp`` carries the original recorded robot time (a faster ~24-27s span).
+    The faithfulness span MUST be derived from the HEADER stamps (the same basis as the
+    per-topic unique counts) -- using the write clock inflates ``expected = span * hz``.
+
+    Each ``topic_specs`` entry is ``(topic, header_hz, write_hz, span_header_s)``: header
+    stamps are spaced ``1/header_hz`` over ``span_header_s``; the SAME number of messages
+    are written with bag-write timestamps spaced ``1/write_hz`` (a slower clock, so the
+    write span is larger). ``header.stamp`` is set to the header ts, decoupled from write.
+    """
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    Image = typestore.types["sensor_msgs/msg/Image"]
+    Header = typestore.types["std_msgs/msg/Header"]
+    Time = typestore.types["builtin_interfaces/msg/Time"]
+
+    with Writer(bag_dir, version=Writer.VERSION_LATEST) as writer:
+        for topic, header_hz, write_hz, span_header_s in topic_specs:
+            header_stamps = _hz_stamps(header_hz, span_s=span_header_s)
+            n = len(header_stamps)
+            write_period_ns = int(round(1e9 / write_hz))
+            write_stamps = [i * write_period_ns for i in range(n)]
+            conn = writer.add_connection(topic, Image.__msgtype__, typestore=typestore)
+            for hdr_ts, write_ts in zip(header_stamps, write_stamps):
+                sec = hdr_ts // 1_000_000_000
+                nanosec = hdr_ts % 1_000_000_000
+                hdr = Header(stamp=Time(sec=int(sec), nanosec=int(nanosec)), frame_id="c")
+                msg = Image(
+                    header=hdr, height=2, width=2, encoding="rgb8", is_bigendian=0,
+                    step=6, data=np.zeros(12, dtype=np.uint8),
+                )
+                # write_ts is the bag-write clock; header.stamp is the robot clock (decoupled)
+                writer.write(conn, write_ts, typestore.serialize_cdr(msg, Image.__msgtype__))
+    return bag_dir
+
+
 def test_faithfulness_keys_and_tier(synthetic_bag):
     """RPLY-02: faithfulness reports max_gap_ms / breach_count / drop_rate; validity tier."""
     reader = BagReader(synthetic_bag, [IN])
@@ -144,6 +186,45 @@ def test_faithfulness_per_topic_rate_scalar_backcompat(tmp_path):
     out = ReplayFaithfulnessMetric().compute(reader, {"output_topics": [CAM], "expected_hz": 10.0})
     assert out["breach_count"] == 0
     assert 90.0 <= out["max_gap_ms"] <= 110.0
+
+
+# --- 01-20 Task 1: BUG 1 — span_s from HEADER stamps (sim-time drop_rate inflation) ---
+
+DEPTH = "/perception_node/camera_0/depth_raw_sim"
+
+
+def test_faithfulness_simtime_droprate_uses_header_span(tmp_path):
+    """BUG 1: ``ros2 bag record`` stamps the bag-WRITE clock (~99s span) while every
+    message's header carries the robot clock (~27s span). drop_rate = (expected-actual)
+    / expected with expected = span * hz; if span comes from the WRITE clock,
+    expected is ~3.6x inflated and a FAITHFUL run reads drop_rate ~0.7 (the e2e: 0.709).
+
+    The fix derives span from HEADER stamps (the same basis as the per-topic unique
+    counts), so a sim-time bag whose header span << write span reads drop_rate ~0.
+    """
+    header_span_s = 27.0
+    write_span_s = 99.0
+    # one Image per header frame; write clock spread over ~99s, header clock over ~27s.
+    write_hz = (round(header_span_s * 5.0) + 1) / write_span_s   # same msg count, slower write clock
+    bag = _write_simtime_bag(
+        tmp_path / "simtime",
+        [
+            (CAM, 5.0, write_hz, header_span_s),     # image_raw_sim at header 5 Hz
+            (DEPTH, 10.0, write_hz * 2, header_span_s),  # depth at header 10 Hz
+        ],
+    )
+    reader = BagReader(bag, [CAM, DEPTH])
+    out = ReplayFaithfulnessMetric().compute(
+        reader,
+        {"output_topics": [CAM, DEPTH],
+         "expected_hz": {"default": 10.0, "image_raw_sim": 5, "semantic_raw_sim": 5}},
+    )
+    # BUG-1 proof: with a header-stamp span the expectation matches the header counts,
+    # so a faithful sim-time bag is ~0 drop. A write-clock span would read ~0.7.
+    assert out["drop_rate"] <= 0.05, out
+    # Documentation of the inflation a write-clock span WOULD have produced (~3.6x):
+    inflation = write_span_s / header_span_s
+    assert inflation > 3.0  # the e2e write/header span ratio that drove drop_rate ~0.7
 
 
 # --- 01-12 Task 2: structural validity checks (contract §5 / verification finding #8) ---

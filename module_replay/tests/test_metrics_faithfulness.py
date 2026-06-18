@@ -227,6 +227,81 @@ def test_faithfulness_simtime_droprate_uses_header_span(tmp_path):
     assert inflation > 3.0  # the e2e write/header span ratio that drove drop_rate ~0.7
 
 
+# --- 01-20 Task 2: configurable per-topic gap tolerance (locked validity policy) ---
+
+UNIFORM = "/perception_node/colored_pointcloud_sim"  # default-rate stream (no hz/gap override)
+
+
+def _stamps_with_gaps(base_hz: float, n_normal: int, gap_ms: float, n_gaps: int,
+                      start_ns: int = 0) -> list[int]:
+    """Evenly-spaced stamps at ``base_hz`` with ``n_gaps`` oversized ``gap_ms`` jumps inserted.
+
+    Produces ``n_normal`` nominal-period intervals plus ``n_gaps`` deliberate stalls of
+    ``gap_ms`` (e.g. the EoMT inference's ~600ms stalls on a 200ms-period 5 Hz stream).
+    """
+    period_ns = int(round(1e9 / base_hz))
+    gap_ns = int(round(gap_ms * 1e6))
+    stamps = [start_ns]
+    for i in range(n_normal + n_gaps):
+        step = gap_ns if i < n_gaps else period_ns   # front-load the big gaps
+        stamps.append(stamps[-1] + step)
+    return stamps
+
+
+def test_gap_tolerance_factor_allows_inference_stalls(tmp_path):
+    """image_raw_sim's FAITHFUL ~600ms EoMT inference stalls (~3.2x the 200ms period at
+    5 Hz) must NOT breach when gap_tolerance is 4.0 (4.0 * 200ms = 800ms threshold). The
+    e2e tripped these at the hardcoded 2x (400ms) -> breach_count 81. Configurable factor."""
+    # 5 Hz (200ms) stream with three 600ms inference stalls
+    bag = _write_bag(
+        tmp_path / "stalls",
+        {CAM: _stamps_with_gaps(5.0, n_normal=40, gap_ms=600.0, n_gaps=3)},
+    )
+    reader = BagReader(bag, [CAM])
+    out = ReplayFaithfulnessMetric().compute(
+        reader,
+        {"output_topics": [CAM],
+         "expected_hz": {"default": 10.0, "image_raw_sim": 5},
+         "gap_tolerance": {"default": 2.0, "image_raw_sim": 4.0}},
+    )
+    assert out["per_topic"][CAM]["breach_count"] == 0, out["per_topic"][CAM]
+    assert out["breach_count"] == 0, out  # no breach contribution from the 600ms stalls
+    # the 600ms gap is still RECORDED (visibility), just not a breach against the 4.0 factor
+    assert 590.0 <= out["per_topic"][CAM]["max_gap_ms"] <= 610.0
+
+
+def test_gap_tolerance_default_two_still_breaches(tmp_path):
+    """A genuine hang on a UNIFORM default-rate topic still breaches at factor 2.0. The
+    elevated 4.0 factor is configured per-stream (image/semantic), NOT a blanket relax: a
+    600ms gap on a 10 Hz (100ms-period) default topic is 6x period > 2.0*100ms = 200ms."""
+    bag = _write_bag(
+        tmp_path / "hang",
+        {UNIFORM: _stamps_with_gaps(10.0, n_normal=50, gap_ms=600.0, n_gaps=1)},
+    )
+    reader = BagReader(bag, [UNIFORM])
+    out = ReplayFaithfulnessMetric().compute(
+        reader,
+        {"output_topics": [UNIFORM],
+         "expected_hz": {"default": 10.0, "image_raw_sim": 5},
+         "gap_tolerance": {"default": 2.0, "image_raw_sim": 4.0}},
+    )
+    assert out["per_topic"][UNIFORM]["breach_count"] >= 1, out["per_topic"][UNIFORM]
+    assert out["breach_count"] >= 1, out
+
+
+def test_gap_factor_for_substring_and_default():
+    """The new _gap_factor_for helper mirrors _expected_hz_for: first non-'default' key
+    that is a substring of the topic wins; else 'default'; a non-dict map -> 2.0."""
+    gt = {"default": 2.0, "image_raw_sim": 4.0, "semantic_raw_sim": 4.0}
+    assert ReplayFaithfulnessMetric._gap_factor_for(
+        "/perception_node/camera_0/image_raw_sim", gt) == 4.0
+    assert ReplayFaithfulnessMetric._gap_factor_for(
+        "/perception_node/camera_0/depth_raw_sim", gt) == 2.0   # falls through to default
+    assert ReplayFaithfulnessMetric._gap_factor_for(
+        "/perception_node/camera_0/depth_raw_sim", {}) == 2.0   # empty map -> 2.0 fallback
+    assert ReplayFaithfulnessMetric._gap_factor_for("/anything", None) == 2.0  # non-dict -> 2.0
+
+
 # --- 01-12 Task 2: structural validity checks (contract §5 / verification finding #8) ---
 
 SEM = [f"/perception_node/camera_{i}/semantic_raw_sim" for i in range(6)]

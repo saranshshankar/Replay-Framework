@@ -71,6 +71,11 @@ expected_hz:
 depth_topics:
   - /perception_node/camera_0/depth_raw_sim
 diagnostics_topic: /perception_node/diagnostics
+gap_tolerance:
+  default: 2.0
+  image_raw_sim: 4.0
+  semantic_raw_sim: 4.0
+latency_stage: inference_seg_extract_segmentation
 """
 
 
@@ -223,9 +228,41 @@ def test_diagnostics_topic_parses_into_str(tmp_path: Path):
     assert spec.diagnostics_topic == "/perception_node/diagnostics"
 
 
+def test_gap_tolerance_parses_into_dict(tmp_path: Path):
+    """01-19 / e2e gap-closure: the `gap_tolerance:` block parses into a
+    dict[str, float] (substring->breach-gap factor), mirroring expected_hz.
+
+    Faithfulness (01-20) reads this per-topic map so the FAITHFUL ~600ms EoMT
+    inference stall on image/semantic (~3.2x the 200ms period at 5Hz) no longer
+    false-breaches against the default 2x tolerance, while a genuine 2x replay
+    hang on a uniform topic still breaches.
+    """
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_WITH_METRIC_CFG)
+    spec = load_module_config("perception", d)
+    assert spec.gap_tolerance == {
+        "default": 2.0,
+        "image_raw_sim": 4.0,
+        "semantic_raw_sim": 4.0,
+    }
+    assert isinstance(spec.gap_tolerance["default"], float)
+
+
+def test_latency_stage_parses_into_str(tmp_path: Path):
+    """01-19 / e2e gap-closure: `latency_stage:` parses into a str LatencyMetric
+    (01-21) parses avg_compute_ms under (the live `inference_seg_extract_segmentation`
+    op name, post seg_argmax->seg_extract rename, e2e module.log)."""
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(_PERCEPTION_WITH_METRIC_CFG)
+    spec = load_module_config("perception", d)
+    assert spec.latency_stage == "inference_seg_extract_segmentation"
+
+
 def test_metric_cfg_fields_default_when_absent(tmp_path: Path):
     """Back-compat: a config with no metric-cfg block defaults expected_hz={},
-    depth_topics=[], diagnostics_topic=None."""
+    depth_topics=[], diagnostics_topic=None, gap_tolerance={}, latency_stage=None."""
     d = tmp_path / "modules"
     d.mkdir()
     (d / "perception.yaml").write_text(_PERCEPTION_NO_THRESHOLDS)
@@ -233,6 +270,8 @@ def test_metric_cfg_fields_default_when_absent(tmp_path: Path):
     assert spec.expected_hz == {}
     assert spec.depth_topics == []
     assert spec.diagnostics_topic is None
+    assert spec.gap_tolerance == {}
+    assert spec.latency_stage is None
 
 
 def test_six_field_modulespec_defaults_metric_cfg():
@@ -249,6 +288,8 @@ def test_six_field_modulespec_defaults_metric_cfg():
     assert spec.expected_hz == {}
     assert spec.depth_topics == []
     assert spec.diagnostics_topic is None
+    assert spec.gap_tolerance == {}
+    assert spec.latency_stage is None
 
 
 def test_missing_preflight_assets_reports_only_missing(tmp_path: Path):

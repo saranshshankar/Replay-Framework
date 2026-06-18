@@ -40,19 +40,40 @@ SEG_ARGMAX_STAGE = "seg_argmax"
 COMPUTE_KEY = "avg_compute_ms"
 
 
+def _stage_matches(status_name: str, stage_name: str, substring_fallback: bool) -> bool:
+    """Match a diagnostics status name against the configured stage.
+
+    Exact match is preferred. When ``substring_fallback`` is True a CONSERVATIVE
+    bidirectional substring match is allowed (the configured stage is contained in
+    the status name, or vice versa) so a config alias like ``seg_extract`` still
+    finds the live ``inference_seg_extract_segmentation`` op. This is only used as
+    a SECONDARY pass (see ``_extract_stage_avg_ms``) so it never shadows an exact
+    match on an unrelated stage.
+    """
+    if status_name == stage_name:
+        return True
+    if substring_fallback and stage_name and status_name:
+        return stage_name in status_name or status_name in stage_name
+    return False
+
+
 def _extract_stage_avg_ms(
-    diagnostics: list[tuple[int, Any]], stage_name: str, key: str
+    diagnostics: list[tuple[int, Any]],
+    stage_name: str,
+    key: str,
+    substring_fallback: bool = False,
 ) -> list[float]:
     """Collect ``float(kv.value)`` for ``kv.key == key`` from the named status.
 
     Mirrors the PoC ``_extract_stage_values``: per diagnostics msg, find the
-    status whose ``.name == stage_name`` and read its KeyValues. Non-parseable
-    values are skipped (graceful) rather than raising.
+    status whose ``.name`` matches ``stage_name`` (exact, or — when
+    ``substring_fallback`` — a conservative substring match) and read its
+    KeyValues. Non-parseable values are skipped (graceful) rather than raising.
     """
     out: list[float] = []
     for _ts, msg in diagnostics:
         for status in getattr(msg, "status", []) or []:
-            if getattr(status, "name", None) != stage_name:
+            if not _stage_matches(getattr(status, "name", "") or "", stage_name, substring_fallback):
                 continue
             for kv in getattr(status, "values", []) or []:
                 if getattr(kv, "key", None) == key:
@@ -60,7 +81,7 @@ def _extract_stage_avg_ms(
                         out.append(float(kv.value))
                     except (ValueError, TypeError):
                         pass
-            break  # one seg_argmax status per msg
+            break  # one matching stage status per msg
     return out
 
 
@@ -74,6 +95,10 @@ class LatencyMetric(BaseMetric):
     def compute(self, reader: BagReader, config: dict) -> dict:
         diag_topic = config.get("diagnostics_topic")
         diagnostics = reader.get_messages(diag_topic) if diag_topic else []
+        # BUG 3: the diagnostics stage is configurable (perception.yaml set it to
+        # the live op inference_seg_extract_segmentation after the seg_argmax ->
+        # seg_extract rename). Default to seg_argmax for back-compat when absent.
+        stage = config.get("latency_stage") or SEG_ARGMAX_STAGE
 
         if not diag_topic or not diagnostics:
             # VISIBLE skip — NOT a silent 0.0 pass. With no scalar latency_p95_ms
@@ -92,15 +117,24 @@ class LatencyMetric(BaseMetric):
                 "num_windows": 0,
             }
 
-        avg_values = _extract_stage_avg_ms(diagnostics, SEG_ARGMAX_STAGE, COMPUTE_KEY)
+        # Exact stage-name match first; if that finds nothing, retry with a
+        # conservative substring fallback (so a config alias like 'seg_extract'
+        # still matches the live 'inference_seg_extract_segmentation'). Exact is
+        # always preferred so the fallback cannot shadow an unrelated stage.
+        avg_values = _extract_stage_avg_ms(diagnostics, stage, COMPUTE_KEY)
         if not avg_values:
-            # Diagnostics present but no seg_argmax/avg_compute_ms — still a visible
-            # skip, never a silent pass.
+            avg_values = _extract_stage_avg_ms(
+                diagnostics, stage, COMPUTE_KEY, substring_fallback=True
+            )
+        if not avg_values:
+            # Diagnostics present but no matching stage/avg_compute_ms — still a
+            # visible skip, never a silent pass. The reason names the CONFIGURED
+            # stage so the skip is debuggable.
             return {
                 "latency_p95_ms": None,
                 "skipped": True,
                 "reason": (
-                    f"no '{SEG_ARGMAX_STAGE}' status with '{COMPUTE_KEY}' in "
+                    f"no '{stage}' status with '{COMPUTE_KEY}' in "
                     f"{len(diagnostics)} diagnostics msgs"
                 ),
                 "diagnostics_topic": diag_topic,

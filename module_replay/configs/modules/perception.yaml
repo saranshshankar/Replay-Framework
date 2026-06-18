@@ -4,13 +4,15 @@ colcon_package: realtime_perception
 # Topic lists verified 2026-06-11 against KT/playbooks/01-perception.md Step 7 +
 # .planning/research/verification/01-perception.md. Topics that are dead in sim are
 # removed so count-based validity metrics don't flag false failures.
+# Real INPUT bag (e2e-2026-06-18/INPUT-BAG-INFO.txt) has NO camera_2 and adds camera_6;
+# output renumbers to contiguous 0..5 (output_topics below already correct — do not change).
 input_topics:
   - /perception_node/camera_0/image_raw
   - /perception_node/camera_1/image_raw
-  - /perception_node/camera_2/image_raw
   - /perception_node/camera_3/image_raw
   - /perception_node/camera_4/image_raw
   - /perception_node/camera_5/image_raw
+  - /perception_node/camera_6/image_raw
   - /perception_node/lidar_107/points
   - /perception_node/lidar_108/points
   # /perception_node/lidar_107/imu/data + lidar_108/imu/data removed: IMU disabled in sim.
@@ -52,6 +54,10 @@ qos_override: configs/qos/perception.yaml
 expected_hz:
   default: 10.0
   diagnostics: 0.2
+  # EoMT ~5 FPS (metrics.json unique_count ~143 over ~27s header span); depth +
+  # pointcloud stay at default 10 Hz.
+  image_raw_sim: 5
+  semantic_raw_sim: 5
 # The 6 depth output topics DepthMetric scans (32FC4); without this it falls back to ALL
 # output topics and decodes rgb/semantic as depth (UAT gap 5).
 depth_topics:
@@ -63,6 +69,17 @@ depth_topics:
   - /perception_node/camera_5/depth_raw_sim
 # The diagnostics topic LatencyMetric parses for seg_argmax compute time (contract §5).
 diagnostics_topic: /perception_node/diagnostics
+# Per-topic breach threshold = gap_tolerance_factor * expected_period. image/
+# semantic have FAITHFUL ~600ms EoMT inference stalls (~3.2x the 200ms period at 5Hz); 4.0
+# lets those pass while a genuine 2x replay hang on a uniform topic still breaches.
+# provisional — Aniket signs off.
+gap_tolerance:
+  default: 2.0
+  image_raw_sim: 4.0
+  semantic_raw_sim: 4.0
+# The live diagnostics inference stage (seg_argmax->seg_extract rename, e2e
+# module.log); LatencyMetric parses avg_compute_ms under this op name (BUG 3).
+latency_stage: inference_seg_extract_segmentation
 
 thresholds:
   validity:

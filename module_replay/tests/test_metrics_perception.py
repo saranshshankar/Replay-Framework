@@ -103,6 +103,116 @@ def test_intrinsic_metrics_json_serializable(synthetic_bag):
         json.dumps(cls().compute(reader, CFG))  # no exception
 
 
+# ── BUG 2: headline scalar keyed by the metric name (generator value[r.name]) ──
+# The report generator reads each plugin's headline scalar as ``value[r.name]``
+# (generator.py:224). latency_p95_ms already follows that contract; pipeline /
+# segmentation / depth did NOT, so all three rendered null/— in the e2e
+# metrics.json. These tests pin the EXACT key the generator reads, additive to
+# the existing detail keys downstream code + plots rely on.
+
+
+def test_pipeline_emits_throughput_scalar_key(tmp_path):
+    """PipelineMetric emits a top-level scalar 'pipeline_throughput_hz' == mean_hz,
+    keeping the existing per_topic + mean_hz keys (generator value[r.name] seam)."""
+    from replay.metrics.perception.pipeline import PipelineMetric
+
+    bag = tmp_path / "pipethroughput"
+    _write_image_bag(bag, [(RGB0, "rgb8", 2, 2, 3, 10, 100_000_000)])  # 10 Hz
+    reader = BagReader(bag, [RGB0])
+    out = PipelineMetric().compute(reader, {"output_topics": [RGB0]})
+    json.dumps(out)
+    # The headline scalar lives under the metric NAME so generator value[r.name] finds it.
+    assert "pipeline_throughput_hz" in out
+    assert isinstance(out["pipeline_throughput_hz"], float)
+    assert out["pipeline_throughput_hz"] == out["mean_hz"]
+    # Existing detail keys preserved (per-topic + the original mean_hz aggregate).
+    assert "per_topic" in out
+    assert "mean_hz" in out
+
+
+def test_segmentation_emits_coverage_scalar_key(tmp_path):
+    """SegmentationMetric emits a top-level scalar 'segmentation_coverage' in [0,1],
+    keeping the per-class mean_class_coverage dict + temporal-consistency keys."""
+    from replay.metrics.perception.segmentation import SegmentationMetric
+
+    bag = tmp_path / "segcoverage"
+    # A 2-frame rgba8 semantic stream (one topic -> one consistency pair).
+    _write_image_bag(bag, [(SEM0, "rgba8", 4, 4, 4, 2, 100_000_000)])
+    reader = BagReader(bag, [SEM0])
+    out = SegmentationMetric().compute(reader, {"output_topics": [SEM0]})
+    json.dumps(out)
+    assert "segmentation_coverage" in out
+    assert isinstance(out["segmentation_coverage"], float)
+    assert 0.0 <= out["segmentation_coverage"] <= 1.0
+    # The per-class coverage DICT (the headline scalar is derived from it) stays.
+    assert "mean_class_coverage" in out
+    assert isinstance(out["mean_class_coverage"], dict)
+    assert "temporal_consistency_mean" in out
+
+
+def test_depth_emits_validity_scalar_key(tmp_path):
+    """DepthMetric emits a top-level scalar 'depth_validity' == mean_valid_fraction,
+    keeping the existing detail keys."""
+    from replay.metrics.perception.depth import DepthMetric
+
+    bag = tmp_path / "depthvalidity"
+    _write_image_bag(bag, [(DEPTH0, "32FC4", 4, 4, 4, 4, 100_000_000)])
+    reader = BagReader(bag, [DEPTH0])
+    out = DepthMetric().compute(reader, {"output_topics": [DEPTH0], "depth_topics": [DEPTH0]})
+    json.dumps(out)
+    assert "depth_validity" in out
+    assert isinstance(out["depth_validity"], float)
+    assert out["depth_validity"] == out["mean_valid_fraction"]
+    assert "mean_valid_fraction" in out
+
+
+def test_three_metrics_gate_through_generator(tmp_path):
+    """End-to-end: wired through generate_report with min thresholds, pipeline /
+    segmentation / depth each produce a row with a NON-NULL value and a
+    True/False ``passed`` (not None) — i.e. the gate now SEES the scalar the
+    plugin emits under its own name (the e2e null/— bug is gone)."""
+    from replay.metrics.perception.pipeline import PipelineMetric
+    from replay.metrics.perception.segmentation import SegmentationMetric
+    from replay.metrics.perception.depth import DepthMetric
+    from replay.metrics.base import MetricResult
+    from replay.module_config import ThresholdSpec
+    from replay.metrics.report.generator import generate_report
+
+    bag = tmp_path / "gatebag"
+    _write_image_bag(bag, [
+        (RGB0, "rgb8", 2, 2, 3, 10, 100_000_000),
+        (SEM0, "rgba8", 4, 4, 4, 2, 100_000_000),
+        (DEPTH0, "32FC4", 4, 4, 4, 4, 100_000_000),
+    ])
+    reader = BagReader(bag, [RGB0, SEM0, DEPTH0])
+    cfg = {"output_topics": [RGB0, SEM0, DEPTH0], "depth_topics": [DEPTH0]}
+
+    pipe = PipelineMetric().compute(reader, cfg)
+    seg = SegmentationMetric().compute(reader, cfg)
+    dep = DepthMetric().compute(reader, cfg)
+
+    results = [
+        MetricResult(name="pipeline_throughput_hz", module="perception", value=pipe,
+                     passed=False, is_regression=False),
+        MetricResult(name="segmentation_coverage", module="perception", value=seg,
+                     passed=False, is_regression=False),
+        MetricResult(name="depth_validity", module="perception", value=dep,
+                     passed=False, is_regression=False),
+    ]
+    th = {
+        "pipeline_throughput_hz": ThresholdSpec(min=1.0, tolerance_band=0.0, tier="quality"),
+        "segmentation_coverage": ThresholdSpec(min=0.0, tolerance_band=0.0, tier="quality"),
+        "depth_validity": ThresholdSpec(min=0.0, tolerance_band=0.0, tier="quality"),
+    }
+    out_dir = tmp_path / "report"
+    generate_report("perception", "t", results, out_dir, th)
+    doc = json.loads((out_dir / "metrics.json").read_text())
+    by_name = {row["name"]: row for row in doc["metrics"]}
+    for name in ("pipeline_throughput_hz", "segmentation_coverage", "depth_validity"):
+        assert by_name[name]["value"] is not None, name  # gate SEES the scalar
+        assert by_name[name]["passed"] in (True, False), name  # evaluated, not skipped
+
+
 def _write_image_bag(bag_dir, topic_specs):
     """Write a rosbag2 dir of Image messages from ``topic_specs``.
 

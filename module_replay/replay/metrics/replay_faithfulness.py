@@ -204,23 +204,45 @@ class ReplayFaithfulnessMetric(BaseMetric):
                 worst_gap = max(worst_gap, max_gap)
             total_breaches += breaches
             total_actual += int(ts.size)   # drop_rate counts UNIQUE frames, not re-emits
-        # EQUAL CROSS-CAMERA COUNTS: the 6 semantic streams must agree (within 1 frame).
+        # EQUAL CROSS-CAMERA COUNTS: the 6 semantic streams must agree. TimeSync emits
+        # complete 6-sets, so a GROSS mismatch is a partial-starve red flag. But the e2e's
+        # 6 cameras carried unique counts 142,143,144,145,146,146 (spread 4) from EoMT
+        # inference jitter, NOT a starve — the old hardcoded ``> 1`` tolerance flagged that
+        # + added a breach -> a FAITHFUL run stuck INVALID. Option (a) (01-20): when the
+        # semantic streams carry an ELEVATED gap_tolerance (> 2.0, i.e. the jittery
+        # inference streams), widen the count tolerance proportionally —
+        # ``max(round(0.1 * max_count), 6)`` — so a <= ~5-frame jitter passes while a gross
+        # ~125-frame starve (10 vs ~135) STILL flags + breaches (fail-closed survives).
+        # Streams WITHOUT an elevated factor keep the strict ``> 1`` tolerance.
         cross_camera_counts = {
             t: per_topic[t]["unique_count"] for t in topics if "semantic_raw_sim" in t
         }
         cross_camera_count_mismatch = False
         if len(cross_camera_counts) >= 2:
             counts = list(cross_camera_counts.values())
-            # tolerance: all within 1 frame of each other (BestEffort startup jitter)
-            if (max(counts) - min(counts)) > 1:
+            sem_topics = [t for t in topics if "semantic_raw_sim" in t]
+            sem_gap_factor = self._gap_factor_for(sem_topics[0], gap_tolerance)
+            if sem_gap_factor > 2.0:
+                # jitter band proportional to the stream depth, floored at 6 frames
+                cross_camera_tol = max(int(round(0.1 * max(counts))), 6)
+            else:
+                cross_camera_tol = 1   # strict default (BestEffort startup jitter only)
+            if (max(counts) - min(counts)) > cross_camera_tol:
                 cross_camera_count_mismatch = True
                 total_breaches += 1   # fail-closed: a partial starve must not pass silently
         drop_rate = ((total_expected - total_actual) / total_expected) if total_expected else 0.0
+        # BUG 4: round for display/storage ONLY, at the assembled output — the threshold
+        # comparisons (breach counts, the min/max clamp) already ran on raw precision.
+        # drop_rate -> 3 decimals; the top-level max_gap_ms and each per-topic max_gap_ms
+        # -> 1 decimal. The 1e9 empty-topic sentinels round harmlessly to 1e9.
+        per_topic_rounded = {
+            t: {**pt, "max_gap_ms": round(pt["max_gap_ms"], 1)} for t, pt in per_topic.items()
+        }
         return {
-            "max_gap_ms": worst_gap,
+            "max_gap_ms": round(worst_gap, 1),
             "breach_count": total_breaches,
-            "drop_rate": float(min(max(drop_rate, 0.0), 1.0)),
-            "per_topic": per_topic,
+            "drop_rate": round(float(min(max(drop_rate, 0.0), 1.0)), 3),
+            "per_topic": per_topic_rounded,
             "empty_topics": empty_topics,
             "cross_camera_count_mismatch": cross_camera_count_mismatch,
             "cross_camera_counts": cross_camera_counts,

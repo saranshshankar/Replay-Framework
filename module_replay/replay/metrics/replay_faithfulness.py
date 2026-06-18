@@ -38,17 +38,16 @@ class ReplayFaithfulnessMetric(BaseMetric):
         return float(expected_hz)
 
     @staticmethod
-    def _unique_stamps_ns(messages) -> tuple[np.ndarray, int]:
-        """Return (sorted unique stamps in ns, raw message count) for a topic.
+    def _header_stamps_ns(messages) -> list[int]:
+        """Extract per-message HEADER stamps (sec/nanosec -> ns) for a topic.
 
-        Dedup is by the message HEADER stamp when the decoded message exposes
-        ``header.stamp`` (sec/nanosec -> ns) -- the contract's stamp-level dedup
-        (``getLatest()`` is non-consuming, ``topic_reader.hpp:84-88``, and can re-emit
-        the same stamp, inflating a raw message count). Falls back to the bag-write
-        timestamp when no header stamp is present. The raw count is preserved
-        alongside ``unique_count`` so a large raw/unique gap stays visible.
+        Uses the decoded message's ``header.stamp`` (the robot clock) when present,
+        falling back to the bag-write timestamp when no header stamp is exposed. This
+        is the SINGLE source of the header-clock basis: ``_unique_stamps_ns`` dedups
+        it for the per-topic counts, and ``compute`` takes the global min/max for the
+        span (BUG 1 fix -- span and counts must share the header clock, not the
+        ~4x-larger bag-write clock that ``ros2 bag record`` stamps).
         """
-        raw_count = len(messages)
         stamps: list[int] = []
         for write_ts, msg in messages:
             hdr = getattr(msg, "header", None)
@@ -57,6 +56,20 @@ class ReplayFaithfulnessMetric(BaseMetric):
                 stamps.append(int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec))
             else:
                 stamps.append(int(write_ts))  # fallback: bag-write timestamp
+        return stamps
+
+    @classmethod
+    def _unique_stamps_ns(cls, messages) -> tuple[np.ndarray, int]:
+        """Return (sorted unique stamps in ns, raw message count) for a topic.
+
+        Dedup is by the message HEADER stamp (via ``_header_stamps_ns``) -- the
+        contract's stamp-level dedup (``getLatest()`` is non-consuming,
+        ``topic_reader.hpp:84-88``, and can re-emit the same stamp, inflating a raw
+        message count). The raw count is preserved alongside ``unique_count`` so a
+        large raw/unique gap stays visible.
+        """
+        raw_count = len(messages)
+        stamps = cls._header_stamps_ns(messages)
         if not stamps:
             return np.empty(0, dtype=float), raw_count
         return np.unique(np.array(stamps, dtype=float)), raw_count
@@ -106,8 +119,13 @@ class ReplayFaithfulnessMetric(BaseMetric):
         # Denominator guard (C1: one starved camera zeroes ALL outputs -- that collapse must
         # BREACH validity, never pass vacuously): expectations use the OVERALL bag span, so
         # an empty/near-empty topic contributes its full expected count as drops.
-        all_ts = [t for topic in topics for t, _ in reader.get_messages(topic)]
-        span_s = ((max(all_ts) - min(all_ts)) / 1e9) if len(all_ts) >= 2 else 0.0
+        # BUG 1: the span MUST come from HEADER stamps (the robot clock), the SAME basis as
+        # the per-topic unique counts below. ``ros2 bag record`` stamps the wall-clock write
+        # time (a ~99s span in the e2e) while the recorded header carries the robot clock
+        # (~27s). A write-clock span makes expected = span * hz ~3.6x too large, so a faithful
+        # sim-time replay reads drop_rate ~0.7 (e2e: 0.709). Header stamps keep both sides aligned.
+        all_header_ns = [s for topic in topics for s in self._header_stamps_ns(reader.get_messages(topic))]
+        span_s = ((max(all_header_ns) - min(all_header_ns)) / 1e9) if len(all_header_ns) >= 2 else 0.0
         if span_s == 0.0:
             # Nothing (or a single message) in the whole output bag: maximally invalid.
             return {"max_gap_ms": 1e9, "breach_count": len(topics), "drop_rate": 1.0,

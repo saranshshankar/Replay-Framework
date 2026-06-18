@@ -94,7 +94,17 @@ class SegmentationMetric(BaseMetric):
             cls: round(float(np.mean(vals)), 4) if vals else 0.0
             for cls, vals in coverage_per_class.items()
         }
+        # BUG2: the report generator reads the headline scalar as value[r.name]
+        # (generator.py:224), but mean_class_coverage is a per-class DICT. Derive
+        # ONE [0,1] scalar == self.name: the mean of the per-class coverage values
+        # (average semantic coverage across the NUM_CLASSES). 0.0 when no frames
+        # were decoded (mirrors the existing zero-shaped degradation). The per-class
+        # dict + temporal-consistency keys are kept, so this is additive.
+        segmentation_coverage = (
+            round(float(np.mean(list(mean_coverage.values()))), 3) if num_frames else 0.0
+        )
         return {
+            "segmentation_coverage": segmentation_coverage,
             "num_frames": num_frames,
             "mean_class_coverage": mean_coverage,
             "temporal_consistency_mean": round(float(np.mean(agreements)), 4) if agreements else 0.0,

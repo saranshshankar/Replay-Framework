@@ -112,9 +112,15 @@ class DepthMetric(BaseMetric):
                 if np.any(valid_mask):
                     means.append(float(np.mean(depth[valid_mask])))
 
+        mean_valid_fraction = round(float(np.mean(valid_fractions)), 4) if valid_fractions else 0.0
         return {
+            # BUG2: headline scalar must live under a key == self.name so the
+            # generator's value[r.name] lookup (generator.py:224) finds it. Keep
+            # mean_valid_fraction (the existing detail key); depth_validity is the
+            # same value, additive.
+            "depth_validity": mean_valid_fraction,
             "num_frames": num_frames,
-            "mean_valid_fraction": round(float(np.mean(valid_fractions)), 4) if valid_fractions else 0.0,
+            "mean_valid_fraction": mean_valid_fraction,
             "min_valid_fraction": round(float(np.min(valid_fractions)), 4) if valid_fractions else 0.0,
             "mean_depth": round(float(np.mean(means)), 3) if means else 0.0,
         }

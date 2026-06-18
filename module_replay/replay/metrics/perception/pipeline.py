@@ -64,7 +64,13 @@ class PipelineMetric(BaseMetric):
             for topic, v in per_topic.items()
             if v["num_messages"] >= 2 and not _is_diagnostics(topic)
         ]
+        mean_hz = round(float(np.mean(hz_values)), 3) if hz_values else 0.0
         return {
+            # BUG2: the report generator reads the headline scalar as value[r.name]
+            # (generator.py:224), so it MUST live under a key == self.name. mean_hz
+            # is kept (per-topic detail + plots rely on it); pipeline_throughput_hz
+            # is the same diagnostics-excluded aggregate, additive.
+            "pipeline_throughput_hz": mean_hz,
             "per_topic": per_topic,
-            "mean_hz": round(float(np.mean(hz_values)), 3) if hz_values else 0.0,
+            "mean_hz": mean_hz,
         }

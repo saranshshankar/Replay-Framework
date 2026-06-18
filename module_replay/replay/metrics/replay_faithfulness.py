@@ -94,6 +94,28 @@ class ReplayFaithfulnessMetric(BaseMetric):
                 return float(hz)
         return float(expected_hz.get("default", 10.0))
 
+    @staticmethod
+    def _gap_factor_for(topic: str, gap_tolerance) -> float:
+        """Return the per-topic gap-tolerance FACTOR for ``topic`` (default 2.0).
+
+        A breach is ``interval > factor * expected_period``. ``gap_tolerance`` is the
+        01-19 substring->factor map (e.g. ``{"default": 2.0, "image_raw_sim": 4.0}``);
+        the first non-"default" key that is a SUBSTRING of the topic wins, else the
+        "default" entry (fallback 2.0). Mirrors ``_expected_hz_for`` exactly so the two
+        maps share one matching shape. image/semantic carry 4.0 (their FAITHFUL ~600ms
+        EoMT inference stalls are ~3.2x the 200ms period); a uniform stream stays 2.0,
+        so a genuine replay hang still breaches. A non-dict / absent map -> 2.0
+        (back-compat: every pre-01-20 test runs at exactly the old hardcoded 2x).
+        """
+        if not isinstance(gap_tolerance, dict):
+            return 2.0
+        for key, factor in gap_tolerance.items():
+            if key == "default":
+                continue
+            if key in topic:
+                return float(factor)
+        return float(gap_tolerance.get("default", 2.0))
+
     def compute(self, reader, config: dict) -> dict:
         """Validity-tier faithfulness with per-topic rate + the contract's structural checks.
 
@@ -116,6 +138,12 @@ class ReplayFaithfulnessMetric(BaseMetric):
         # match, "default" fallback). This is the UAT-gap-1 fix: diagnostics at 0.2 Hz
         # gets a 10000 ms breach threshold and a span*0.2 expected count, not a flat 10 Hz.
         expected_hz_map = config.get("expected_hz", 10.0)
+        # 01-19/01-20 per-topic gap-tolerance map (substring->factor, e.g.
+        # {"default": 2.0, "image_raw_sim": 4.0}). The per-topic breach is
+        # ``interval > factor * expected_period``; image/semantic carry 4.0 so their
+        # FAITHFUL ~600ms EoMT inference stalls don't trip while a uniform-stream hang
+        # still does. Absent map -> _gap_factor_for returns 2.0 (the old hardcoded 2x).
+        gap_tolerance = config.get("gap_tolerance", {})
         # Denominator guard (C1: one starved camera zeroes ALL outputs -- that collapse must
         # BREACH validity, never pass vacuously): expectations use the OVERALL bag span, so
         # an empty/near-empty topic contributes its full expected count as drops.
@@ -148,6 +176,8 @@ class ReplayFaithfulnessMetric(BaseMetric):
             hz = self._expected_hz_for(topic, expected_hz_map)
             is_uniform = hz >= default_hz   # slow topics excluded from the headline max_gap_ms
             expected_period_ms = 1000.0 / hz
+            # PER-TOPIC gap-tolerance factor (image/semantic 4.0, else default 2.0).
+            gap_factor = self._gap_factor_for(topic, gap_tolerance)
             expected_per_topic = max(int(round(span_s * hz)), 1)
             total_expected += expected_per_topic
             # UNIQUE-STAMP DEDUP before the gap/drop math (re-emit must not inflate counts).
@@ -164,9 +194,10 @@ class ReplayFaithfulnessMetric(BaseMetric):
                 continue
             intervals_ms = np.diff(ts) / 1e6   # ts is already sorted-unique
             max_gap = float(np.max(intervals_ms))
-            # breach threshold is PER-TOPIC: 2 * this topic's nominal period
-            # (diagnostics at 0.2 Hz => 10000 ms, not the cameras' 200 ms).
-            breaches = int(np.sum(intervals_ms > 2 * expected_period_ms))
+            # breach threshold is PER-TOPIC: gap_factor * this topic's nominal period
+            # (diagnostics at 0.2 Hz => 2x 5000 = 10000 ms; image/semantic at 5 Hz with a
+            # 4.0 factor => 800 ms, so their ~600ms EoMT inference stalls are not breaches).
+            breaches = int(np.sum(intervals_ms > gap_factor * expected_period_ms))
             per_topic[topic] = {"max_gap_ms": max_gap, "breach_count": breaches,
                                 "count": raw_count, "unique_count": int(ts.size)}
             if is_uniform:

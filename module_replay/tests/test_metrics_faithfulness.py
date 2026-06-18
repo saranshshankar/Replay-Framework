@@ -90,6 +90,35 @@ def _write_simtime_bag(bag_dir: Path, topic_specs: list[tuple[str, float, float,
     return bag_dir
 
 
+def test_faithfulness_span_excludes_diagnostics_window(tmp_path):
+    """BUG1 residual (found in e2e render verification): the diagnostics housekeeping topic
+    publishes on a WALL-clock timer (report_interval_sec) and its HEADER stamps cover a LONGER
+    window (~100s) than the perception camera output (~28s). The drop_rate span basis must be
+    the perception-output topics, EXCLUDING the configured diagnostics_topic — otherwise the
+    global span (driven by diagnostics) inflates every camera's expected=span*hz and a faithful
+    run false-INVALIDs. (The 01-22 fixture CAPPED the diagnostics span to dodge this; the real
+    bag does not, so this asserts the un-capped reality.)"""
+    CAM = "/perception_node/camera_0/image_raw_sim"
+    DIAG = "/perception_node/diagnostics"
+    bag = _write_simtime_bag(
+        tmp_path / "diagspan",
+        # (topic, header_hz, write_hz, span_header_s)
+        [(CAM, 5.0, 2.0, 28.0),      # camera: faithful 5 Hz over its own 28s window
+         (DIAG, 0.2, 0.2, 100.0)],   # diagnostics: 0.2 Hz over a LONGER 100s window
+    )
+    reader = BagReader(bag, [CAM, DIAG])
+    cfg = {
+        "output_topics": [CAM, DIAG],
+        "expected_hz": {"default": 10.0, "image_raw_sim": 5.0, "diagnostics": 0.2},
+        "gap_tolerance": {"default": 2.0, "image_raw_sim": 4.0},
+        "diagnostics_topic": DIAG,
+    }
+    out = ReplayFaithfulnessMetric().compute(reader, cfg)
+    # The camera delivered ~5 Hz over its OWN 28s window — a faithful run. Span must come from
+    # the camera (28s), NOT the diagnostics 100s window, so drop_rate stays ~0.
+    assert out["drop_rate"] <= 0.02, (out["drop_rate"], out["per_topic"][CAM])
+
+
 def test_faithfulness_keys_and_tier(synthetic_bag):
     """RPLY-02: faithfulness reports max_gap_ms / breach_count / drop_rate; validity tier."""
     reader = BagReader(synthetic_bag, [IN])

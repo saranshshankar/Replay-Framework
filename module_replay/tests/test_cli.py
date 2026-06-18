@@ -476,6 +476,8 @@ def test_build_metrics_cfg_threads_new_keys():
         expected_hz={"default": 10.0, "diagnostics": 0.2},
         depth_topics=["/perception_node/camera_0/depth_raw_sim"],
         diagnostics_topic="/perception_node/diagnostics",
+        gap_tolerance={"default": 2.0, "image_raw_sim": 4.0},
+        latency_stage="inference_seg_extract_segmentation",
     )
     cfg = _build_metrics_cfg(spec)
     assert cfg["input_topics"] == spec.input_topics
@@ -483,6 +485,9 @@ def test_build_metrics_cfg_threads_new_keys():
     assert cfg["expected_hz"] == {"default": 10.0, "diagnostics": 0.2}
     assert cfg["depth_topics"] == ["/perception_node/camera_0/depth_raw_sim"]
     assert cfg["diagnostics_topic"] == "/perception_node/diagnostics"
+    # 01-19 gap-closure: the two new keys thread through alongside the existing ones.
+    assert cfg["gap_tolerance"] == {"default": 2.0, "image_raw_sim": 4.0}
+    assert cfg["latency_stage"] == "inference_seg_extract_segmentation"
 
 
 def _semantic_bag(bag_dir: Path, frames):

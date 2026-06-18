@@ -292,6 +292,35 @@ def test_six_field_modulespec_defaults_metric_cfg():
     assert spec.latency_stage is None
 
 
+def test_build_metrics_cfg_threads_gap_tolerance_and_latency_stage():
+    """01-19: _build_metrics_cfg threads gap_tolerance + latency_stage into the cfg
+    every plugin/faithfulness receives, alongside the pre-existing keys.
+
+    01-20 (faithfulness) reads gap_tolerance for the per-topic breach threshold;
+    01-21 (LatencyMetric) reads latency_stage for the diagnostics op name."""
+    from replay.cli import _build_metrics_cfg
+
+    spec = ModuleSpec(
+        name="perception",
+        container="planner",
+        colcon_package="realtime_perception",
+        input_topics=["/perception_node/camera_0/image_raw"],
+        output_topics=["/perception_node/camera_0/image_raw_sim"],
+        launch_command="x",
+        gap_tolerance={"default": 2.0, "image_raw_sim": 4.0},
+        latency_stage="inference_seg_extract_segmentation",
+    )
+    cfg = _build_metrics_cfg(spec)
+    assert cfg["gap_tolerance"] == {"default": 2.0, "image_raw_sim": 4.0}
+    assert cfg["latency_stage"] == "inference_seg_extract_segmentation"
+    # Pre-existing keys remain present (additive change, nothing dropped).
+    assert cfg["input_topics"] == spec.input_topics
+    assert cfg["output_topics"] == spec.output_topics
+    assert "expected_hz" in cfg
+    assert "depth_topics" in cfg
+    assert "diagnostics_topic" in cfg
+
+
 def test_missing_preflight_assets_reports_only_missing(tmp_path: Path):
     """B5 phase-0 fail-fast: the checker returns exactly the asset paths that don't exist."""
     present = tmp_path / "present.trt"

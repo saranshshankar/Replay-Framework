@@ -347,6 +347,81 @@ def test_faithfulness_cross_camera_equal_counts_not_flagged(tmp_path):
     assert out["breach_count"] == 0
 
 
+# --- 01-20 Task 3: jitter-tolerant cross-camera check + BUG 4 decimal rounding ---
+
+
+def test_cross_camera_inference_jitter_not_invalid(tmp_path):
+    """The e2e's 6 semantic cameras carried unique counts 142,143,144,145,146,146 — a
+    spread of 4 from EoMT inference jitter (NOT a starve; every camera has ~145 frames).
+    The hardcoded ``> 1`` tolerance flagged this + added a breach -> kept a FAITHFUL run
+    INVALID. With the streams carrying an elevated gap_tolerance (4.0), the cross-camera
+    tolerance widens proportionally so a <= ~5-frame jitter does NOT breach. Option (a):
+    the flag/counts stay surfaced for visibility; only the BREACH contribution is removed.
+    """
+    # mirror the e2e: header 5 Hz over ~29s -> ~146 frames; truncate to spread 142-146
+    counts = [144, 143, 146, 146, 145, 142]
+    topic_stamps = {SEM[i]: _hz_stamps(5.0, span_s=29.0)[:counts[i]] for i in range(6)}
+    bag = _write_bag(tmp_path / "jitter", topic_stamps)
+    reader = BagReader(bag, SEM)
+    base = ReplayFaithfulnessMetric().compute(
+        reader,
+        {"output_topics": SEM,
+         "expected_hz": {"default": 10.0, "semantic_raw_sim": 5},
+         "gap_tolerance": {"default": 2.0, "semantic_raw_sim": 4.0}},
+    )
+    # counts are still surfaced (visibility preserved)
+    assert set(base["cross_camera_counts"].values()) == set(counts), base["cross_camera_counts"]
+    # but the 142-146 jitter contributes NO cross-camera breach (would have been +1 before)
+    assert base["cross_camera_count_mismatch"] is False, base
+    # prove the breach contribution is 0: per-topic breaches sum == total breach_count
+    per_topic_breaches = sum(v["breach_count"] for v in base["per_topic"].values())
+    assert base["breach_count"] == per_topic_breaches, base
+
+
+def test_cross_camera_gross_starve_still_flags(tmp_path):
+    """A GROSS partial-starve (one camera at ~10 frames vs peers at ~135) must STILL flag
+    AND breach even under the widened jitter tolerance — the fail-closed partial-starve
+    guard survives. Over-widening past the gross-starve spread would let a real starve
+    pass silently; the tolerance must absorb a ~5-frame jitter but never a ~125-frame gap."""
+    counts = [135, 135, 134, 10, 135, 135]   # camera 3 grossly starved
+    topic_stamps = {SEM[i]: _hz_stamps(5.0, span_s=27.0)[:counts[i]] for i in range(6)}
+    bag = _write_bag(tmp_path / "gross", topic_stamps)
+    reader = BagReader(bag, SEM)
+    out = ReplayFaithfulnessMetric().compute(
+        reader,
+        {"output_topics": SEM,
+         "expected_hz": {"default": 10.0, "semantic_raw_sim": 5},
+         "gap_tolerance": {"default": 2.0, "semantic_raw_sim": 4.0}},
+    )
+    assert out["cross_camera_count_mismatch"] is True, out
+    # the cross-camera mismatch adds its fail-closed breach on top of any per-topic breaches
+    per_topic_breaches = sum(v["breach_count"] for v in out["per_topic"].values())
+    assert out["breach_count"] > per_topic_breaches, out
+
+
+def test_faithfulness_decimals_rounded(tmp_path):
+    """BUG 4 (display/storage): the e2e wrote drop_rate 0.7091667310217005 and max_gap_ms
+    199.999996 — unreadable float noise. drop_rate rounds to 3 decimals; the top-level
+    max_gap_ms and every per-topic max_gap_ms round to 1 decimal. Rounding is at the RETURN
+    dict only — the threshold comparisons already ran on raw precision."""
+    # a bag that yields non-round values: 5 Hz with a 599.999986-style gap
+    bag = _write_bag(
+        tmp_path / "round",
+        {CAM: _stamps_with_gaps(5.0, n_normal=20, gap_ms=600.0, n_gaps=2),
+         UNIFORM: _hz_stamps(10.0, span_s=4.0)},
+    )
+    reader = BagReader(bag, [CAM, UNIFORM])
+    out = ReplayFaithfulnessMetric().compute(
+        reader,
+        {"output_topics": [CAM, UNIFORM],
+         "expected_hz": {"default": 10.0, "image_raw_sim": 5}},
+    )
+    assert round(out["drop_rate"], 3) == out["drop_rate"], out["drop_rate"]
+    assert round(out["max_gap_ms"], 1) == out["max_gap_ms"], out["max_gap_ms"]
+    for topic, pt in out["per_topic"].items():
+        assert round(pt["max_gap_ms"], 1) == pt["max_gap_ms"], (topic, pt["max_gap_ms"])
+
+
 # --- 01-12 residual (UAT gap 1, validity-VERDICT half): the headline max_gap_ms gate ---
 # 01-12 fixed per-topic breach_count, but the TOP-LEVEL max_gap_ms (the field
 # replay_max_gap_ms gates on) still carried diagnostics' legit 5000ms gap -> healthy

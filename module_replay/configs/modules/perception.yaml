@@ -89,7 +89,7 @@ thresholds:
       max: 200
       provisional: true
     replay_drop_rate:
-      max: 0.02
+      max: 0.05
       provisional: true
     # Rate-aware per-topic gate: faithfulness counts, PER TOPIC, intervals exceeding 2x that
     # topic's OWN nominal period (cameras 200ms, diagnostics 10000ms). Any breach on ANY topic

@@ -40,6 +40,8 @@ def _build_metrics_cfg(module_spec) -> dict:
         "expected_hz": module_spec.expected_hz,        # per-topic map (01-12 reads it)
         "depth_topics": module_spec.depth_topics,      # 01-13 DepthMetric reads it
         "diagnostics_topic": module_spec.diagnostics_topic,  # 01-13 LatencyMetric reads it
+        "gap_tolerance": module_spec.gap_tolerance,    # 01-20 faithfulness per-topic breach factor
+        "latency_stage": module_spec.latency_stage,    # 01-21 LatencyMetric diagnostics op name
     }
 
 

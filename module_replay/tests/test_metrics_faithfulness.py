@@ -143,7 +143,7 @@ def test_faithfulness_empty_topic_breaches(synthetic_bag):
     out = ReplayFaithfulnessMetric().compute(reader, {"output_topics": [IN, missing], "expected_hz": 10.0})
     assert missing in out["empty_topics"]
     assert out["breach_count"] >= 1
-    assert out["drop_rate"] > 0.02   # breaches the replay_drop_rate validity threshold
+    assert out["drop_rate"] > 0.05   # breaches the replay_drop_rate validity threshold (0.05)
 
 
 def test_faithfulness_accepts_expected_hz_dict(synthetic_bag):

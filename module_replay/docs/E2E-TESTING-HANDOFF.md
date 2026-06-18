@@ -214,7 +214,7 @@ perception bag, evaluates it, and exits green.
 Two **independent** ways a metric passes/fails, plus three tiers:
 
 - **Validity tier** (faithfulness, always on): is the replay itself trustworthy? Gates
-  `replay_max_gap_ms` (≤200 ms, computed over uniform ~10 Hz topics), `replay_drop_rate` (≤0.02),
+  `replay_max_gap_ms` (≤200 ms, computed over uniform ~10 Hz topics), `replay_drop_rate` (≤0.05),
   `replay_breach_count` (=0, the rate-aware per-topic stall count). **Breach → exit 2 INVALID** —
   quality metrics are not even trusted.
 - **Quality tier** (intrinsic, no baseline needed): is the output good in absolute terms?

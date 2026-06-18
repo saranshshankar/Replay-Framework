@@ -266,7 +266,9 @@ def test_e2e_uses_real_perception_config():
     # the real validity gate the e2e tripped
     assert "replay_breach_count" in spec.thresholds
     assert spec.thresholds["replay_breach_count"].max == 0
-    assert spec.thresholds["replay_drop_rate"].max == 0.02
+    # 0.05 (raised from 0.02): margin for the inference-limited image/semantic streams
+    # whose ~600ms EoMT stalls cost a few frames vs span*hz. Provisional, Aniket-calibrated.
+    assert spec.thresholds["replay_drop_rate"].max == 0.05
     # the BUG-3 live op name perception.yaml configured
     assert spec.latency_stage == LATENCY_STAGE
 
@@ -287,11 +289,11 @@ def test_e2e_verdict_flips_invalid_to_not_invalid(e2e_metrics):
 def test_e2e_drop_rate_no_longer_inflated(e2e_metrics):
     """BUG 1: the e2e read drop_rate 0.709 because the expectation used the ~99s
     bag-WRITE span. With the span derived from the ~31s HEADER clock, this faithful
-    sim-time bag reads <= 0.02 (the real validity threshold)."""
+    sim-time bag reads ~0 — far under the 0.05 validity gate."""
     _rc, doc, _counts, spec = e2e_metrics
     drop = doc["replay_faithfulness"]["drop_rate"]
-    assert drop <= 0.02, drop
-    # and it actually clears the REAL configured threshold (not a hand-picked 0.02)
+    assert drop <= 0.02, drop   # tight correctness bound: the fix yields a near-zero drop
+    # and it clears the REAL configured threshold (read dynamically, currently 0.05)
     assert drop <= spec.thresholds["replay_drop_rate"].max
 
 

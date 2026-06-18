@@ -152,7 +152,17 @@ class ReplayFaithfulnessMetric(BaseMetric):
         # time (a ~99s span in the e2e) while the recorded header carries the robot clock
         # (~27s). A write-clock span makes expected = span * hz ~3.6x too large, so a faithful
         # sim-time replay reads drop_rate ~0.7 (e2e: 0.709). Header stamps keep both sides aligned.
-        all_header_ns = [s for topic in topics for s in self._header_stamps_ns(reader.get_messages(topic))]
+        #
+        # BUG 1 residual: the span basis EXCLUDES the diagnostics housekeeping topic. Diagnostics
+        # publishes on a WALL-clock timer (report_interval_sec) so its header stamps cover a
+        # LONGER window (~100s: 20 msgs @ 0.2Hz) than the perception camera/depth output (~27s).
+        # Including it makes the global span ~100s and inflates every output topic's
+        # expected = span * hz, so a faithful run false-INVALIDs (drop_rate ~0.7). The span must be
+        # the window the perception OUTPUT covers; diagnostics is still drop/gap-checked per-topic
+        # below. Falls back to all topics if excluding diagnostics leaves nothing (degenerate bag).
+        diag_topic = config.get("diagnostics_topic")
+        span_topics = [t for t in topics if t != diag_topic] or topics
+        all_header_ns = [s for topic in span_topics for s in self._header_stamps_ns(reader.get_messages(topic))]
         span_s = ((max(all_header_ns) - min(all_header_ns)) / 1e9) if len(all_header_ns) >= 2 else 0.0
         if span_s == 0.0:
             # Nothing (or a single message) in the whole output bag: maximally invalid.

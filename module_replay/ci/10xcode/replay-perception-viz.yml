@@ -1,0 +1,55 @@
+# DEPLOY TO: 10xCode  ->  .github/workflows/replay-perception-viz.yml
+#
+# On-demand Tier-3 visualization for the perception replay gate (TIER3-VIZ-DESIGN §7).
+# A developer manually triggers this for a SPECIFIC gate run to get the overlap +
+# combined-grid debug videos. It is fully DECOUPLED from the blocking gate:
+#   * CPU-only (GitHub-hosted ubuntu-latest) — NO GPU, NO RunsOn, NO TensorRT engine;
+#   * NO S3 / OIDC — it reads the gate run's ALREADY-RECORDED output-bag artifact;
+#   * NOT a pull_request trigger — it never runs in, or slows, the gate, and the gate
+#     never pulls the [viz] dependencies.
+# Developer loop: gate goes red on a PR -> open Actions -> run this with that run's id
+# -> download viz-<run_id> -> inspect the mp4s.
+name: replay-perception-viz
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "gate run id whose output-bag-<run_id> artifact to visualize"
+        required: true
+
+permissions:
+  contents: read
+  actions: read          # read another run's artifact (the gate run's output bag)
+
+jobs:
+  viz:
+    runs-on: ubuntu-latest          # CPU only — viz reads the recorded bag; no GPU/engine/S3-OIDC
+    steps:
+      - name: Checkout the replay framework (imported as a library)
+        uses: actions/checkout@v4
+        with:
+          repository: saranshshankar/Replay-Framework
+          ref: main
+          token: ${{ secrets.FRAMEWORK_READ_TOKEN }}
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install the framework with the [viz] extra (mp4 encoder)
+        run: pip install -e "./module_replay[viz]"
+      - name: Download the gate run's recorded output bag
+        uses: actions/download-artifact@v4
+        with:
+          name: output-bag-${{ inputs.run_id }}
+          path: /tmp/output/replay_output
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Render the Tier-3 debug videos (overlap + per-camera combined grid)
+        run: |
+          cd module_replay
+          replay-module viz --module perception \
+            --bag /tmp/output/replay_output --output /tmp/vizrun
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viz-${{ inputs.run_id }}
+          path: /tmp/vizrun/viz
+          retention-days: 5

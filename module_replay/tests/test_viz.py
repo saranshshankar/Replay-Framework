@@ -10,12 +10,14 @@ imports the viz package or the mp4 encoder, and viz never affects the verdict.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from replay.metrics.base import BaseVisualization
 from replay.metrics.registry import register_viz, get_viz_plugins
@@ -344,3 +346,45 @@ def test_metrics_run_viz_renders_and_links(tmp_path):
                "--output", str(out), "--run-viz"])
     assert list((out / "viz").glob("*.mp4"))
     assert "../viz/" in (out / "reports" / "report.html").read_text()
+
+
+# ── on-demand cloud viz workflow template (§7) ───────────────────────────────
+
+VIZ_WORKFLOW = Path(__file__).resolve().parents[1] / "ci" / "10xcode" / "replay-perception-viz.yml"
+
+
+def test_viz_workflow_parses_and_is_decoupled_cpu_only():
+    """The cloud viz template is on-demand, CPU-only, and fully decoupled from the
+    blocking GPU gate (TIER3-VIZ-DESIGN §7): no RunsOn GPU, no engine, no S3/OIDC,
+    not a pull_request trigger; it just installs [viz] and renders the recorded bag."""
+    raw = VIZ_WORKFLOW.read_text()
+    wf = yaml.safe_load(raw)
+    assert isinstance(wf, dict)
+
+    # on-demand only — never part of the gate
+    on = wf.get("on") or wf.get(True)
+    assert "workflow_dispatch" in on
+    assert "pull_request" not in on
+
+    # CPU only: GitHub-hosted ubuntu, no RunsOn GPU label, no GPU profile
+    for job in wf["jobs"].values():
+        assert job["runs-on"] == "ubuntu-latest"
+    assert "runs-on=" not in raw and "replay-gpu" not in raw
+
+    # decoupled: no S3/OIDC, no engine, no GHCR image pull
+    assert "id-token" not in (wf.get("permissions") or {})
+    assert "configure-aws-credentials" not in raw
+    assert "PERCEPTION_ENGINE_S3" not in raw
+
+    # it installs the [viz] extra and runs the viz subcommand
+    assert "[viz]" in raw and "replay-module viz" in raw
+
+    # every action pinned to a concrete ref; the artifact is ephemeral
+    pin = re.compile(r"@(v?\d|[0-9a-f]{40})")
+    for job in wf["jobs"].values():
+        for step in job.get("steps") or []:
+            uses = step.get("uses")
+            if uses:
+                assert pin.search(uses), f"action {uses!r} must pin a concrete ref"
+            if (uses or "").startswith("actions/upload-artifact"):
+                assert (step.get("with") or {}).get("retention-days") == 5

@@ -234,16 +234,39 @@ s3://origin-replay-bags/
 
 ## Part 7 — The files you deploy into 10xCode
 
-All three are in this repo under `module_replay/ci/10xcode/` and are copy-paste ready:
+All four are in this repo under `module_replay/ci/10xcode/` and are copy-paste ready:
 
 | Source (here) | Destination (10xCode) |
 |---|---|
 | `module_replay/ci/10xcode/runs-on.yml` | `.github/runs-on.yml` |
 | `module_replay/ci/10xcode/replay-perception-gate.yml` | `.github/workflows/replay-perception-gate.yml` |
 | `module_replay/ci/10xcode/replay-perception-nightly.yml` | `.github/workflows/replay-perception-nightly.yml` |
+| `module_replay/ci/10xcode/replay-perception-viz.yml` | `.github/workflows/replay-perception-viz.yml` |
 
 The gate workflow's logic = the Part 0 picture: detect (via the `paths:` filter) → replay
 (RunsOn GPU, replay only) → metrics (cheap, gates on `metrics.json["pass"]`) → gate.
+
+---
+
+## Part 7a — Generate visualizations on demand (Tier-3 viz)
+
+The gate stays cheap and image-free. When a developer wants to *see* what a run did —
+cross-camera overlap, semantic masks, depth, temporal consistency — they trigger
+**`replay-perception-viz`** manually for that gate run. It is fully decoupled from the
+blocking gate (TIER3-VIZ-DESIGN §7):
+
+- **CPU-only, GitHub-hosted `ubuntu-latest`** — NO GPU, NO RunsOn, NO TensorRT engine, NO
+  S3/OIDC. It only reads the gate run's already-recorded `output-bag-<run_id>` artifact.
+- It `pip install`s the framework with the **`[viz]`** extra (the mp4 encoder), runs
+  `replay-module viz`, and uploads the mp4s as `viz-<run_id>` (5-day retention).
+- It is `workflow_dispatch` only — never a `pull_request` trigger — so it never runs in,
+  slows, or adds dependencies to the gate.
+
+**Developer loop:** gate goes red on a PR → open **Actions → replay-perception-viz → Run
+workflow**, paste the gate run's id → download the `viz-<run_id>` artifact → inspect
+`overlap_cam*.mp4` + `combined_cam*.mp4`. Locally the same videos come from
+`replay-module viz --module perception --bag <output_bag> --output <dir>` (or `--run-viz`
+on `all` / `metrics`); both need the `[viz]` extra (`pip install module_replay[viz]`).
 
 ---
 

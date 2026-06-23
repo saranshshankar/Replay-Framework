@@ -175,3 +175,45 @@ def test_metrics_path_does_not_import_viz_or_encoder():
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "CLEAN" in r.stdout, r.stdout
+
+
+# ── overlap_video plugin (V2 revamp of Aniket's generate_overlap_videos) ─────
+
+
+def _read_mp4_first_frame(path: Path) -> np.ndarray:
+    import imageio.v2 as imageio
+
+    rdr = imageio.get_reader(str(path))
+    try:
+        return rdr.get_data(0)
+    finally:
+        rdr.close()
+
+
+def test_overlap_video_produces_readable_mp4(tmp_path):
+    """A calibratable cam pair (2,3) yields a non-empty, ffmpeg-decodable mp4."""
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.perception.viz.overlap_video import OverlapVideo
+
+    bag, topics = _write_pair_bag(tmp_path / "bag", cams=(2, 3), n_frames=6)
+    reader = BagReader(bag, topics)
+    out = OverlapVideo().render(reader, {"output_topics": topics}, tmp_path)
+
+    assert len(out) >= 1
+    mp4 = out[0]
+    assert mp4.suffix == ".mp4" and mp4.exists() and mp4.stat().st_size > 0
+    frame = _read_mp4_first_frame(mp4)
+    assert frame.ndim == 3 and frame.shape[2] == 3  # decodable RGB video
+
+
+def test_overlap_video_no_configured_pairs_returns_empty(synthetic_bag):
+    """A bag with no complete adjacency pair (only cam 0's image_raw_sim, no
+    semantic) renders nothing and never raises."""
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.perception.viz.overlap_video import OverlapVideo
+
+    out_topic = "/perception_node/camera_0/image_raw_sim"
+    reader = BagReader(synthetic_bag, [out_topic])
+    out = OverlapVideo().render(
+        reader, {"output_topics": [out_topic]}, synthetic_bag.parent / "viz_none")
+    assert out == []

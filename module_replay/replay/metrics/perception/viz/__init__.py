@@ -10,5 +10,6 @@ Both plugins are faithful V2 revamps of Aniket's PoC viz
 PoC ``BagReader``/constants onto the framework ``BagReader`` + ``overlap.py`` geometry.
 """
 from .overlap_video import OverlapVideo
+from .semantic_overlay import SemanticOverlay
 
-__all__ = ["OverlapVideo"]
+__all__ = ["OverlapVideo", "SemanticOverlay"]

@@ -217,3 +217,80 @@ def test_overlap_video_no_configured_pairs_returns_empty(synthetic_bag):
     out = OverlapVideo().render(
         reader, {"output_topics": [out_topic]}, synthetic_bag.parent / "viz_none")
     assert out == []
+
+
+# ── semantic_overlay plugin (V2 revamp of Aniket's generate_combined_videos) ──
+
+
+def _write_combined_bag(bag_dir: Path, cam: int = 0, n_frames: int = 4,
+                        with_depth: bool = True) -> tuple[Path, list[str]]:
+    """Write one camera's image_raw_sim (rgb8) + semantic_raw_sim (rgba8) +
+    optionally depth_raw_sim (32FC1), stamp-aligned, for the combined grid."""
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    Image = typestore.types["sensor_msgs/msg/Image"]
+    Header = typestore.types["std_msgs/msg/Header"]
+    Time = typestore.types["builtin_interfaces/msg/Time"]
+
+    rgb_t = f"/perception_node/camera_{cam}/image_raw_sim"
+    sem_t = f"/perception_node/camera_{cam}/semantic_raw_sim"
+    depth_t = f"/perception_node/camera_{cam}/depth_raw_sim"
+    topics = [rgb_t, sem_t] + ([depth_t] if with_depth else [])
+
+    rgb = _textured_rgb(120, seed=3)
+    sem_plane = (np.indices((90, 90)).sum(0) % 6).astype(np.int16)
+    rgba = _classid_rgba(sem_plane)
+    depth = (np.linspace(0.5, 4.0, 64 * 64, dtype=np.float32)).reshape(64, 64)
+
+    def _depth_msg(ts):
+        sec, nanosec = ts // 1_000_000_000, ts % 1_000_000_000
+        hdr = Header(stamp=Time(sec=int(sec), nanosec=int(nanosec)), frame_id="cam")
+        h, w = depth.shape
+        return Image(header=hdr, height=h, width=w, encoding="32FC1", is_bigendian=0,
+                     step=w * 4, data=np.frombuffer(depth.tobytes(), dtype=np.uint8))
+
+    with Writer(bag_dir, version=Writer.VERSION_LATEST) as writer:
+        conns = {t: writer.add_connection(t, Image.__msgtype__, typestore=typestore)
+                 for t in topics}
+        for i in range(n_frames):
+            ts = i * 100_000_000
+            writer.write(conns[rgb_t], ts, typestore.serialize_cdr(
+                _img_msg(typestore, rgb, "rgb8", ts), Image.__msgtype__))
+            # vary the semantic plane slightly so the temporal-diff quadrant differs
+            shifted = ((sem_plane + i) % 6).astype(np.int16)
+            writer.write(conns[sem_t], ts, typestore.serialize_cdr(
+                _img_msg(typestore, _classid_rgba(shifted), "rgba8", ts), Image.__msgtype__))
+            if with_depth:
+                writer.write(conns[depth_t], ts, typestore.serialize_cdr(
+                    _depth_msg(ts), Image.__msgtype__))
+    return bag_dir, topics
+
+
+def test_semantic_overlay_produces_readable_mp4(tmp_path):
+    """A camera with rgb + semantic + depth yields a decodable per-camera grid mp4."""
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.perception.viz.semantic_overlay import SemanticOverlay
+
+    bag, topics = _write_combined_bag(tmp_path / "bag", cam=0, n_frames=4, with_depth=True)
+    reader = BagReader(bag, topics)
+    out = SemanticOverlay().render(reader, {"output_topics": topics}, tmp_path)
+
+    assert len(out) >= 1
+    mp4 = out[0]
+    assert mp4.suffix == ".mp4" and mp4.exists() and mp4.stat().st_size > 0
+    frame = _read_mp4_first_frame(mp4)
+    assert frame.ndim == 3 and frame.shape[2] == 3
+
+
+def test_semantic_overlay_without_depth_still_renders(tmp_path):
+    """A camera with no depth topic still renders (depth quadrant shows N/A)."""
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.perception.viz.semantic_overlay import SemanticOverlay
+
+    bag, topics = _write_combined_bag(tmp_path / "bag", cam=0, n_frames=3, with_depth=False)
+    reader = BagReader(bag, topics)
+    out = SemanticOverlay().render(reader, {"output_topics": topics}, tmp_path)
+
+    assert len(out) >= 1 and out[0].exists() and out[0].stat().st_size > 0

@@ -294,3 +294,53 @@ def test_semantic_overlay_without_depth_still_renders(tmp_path):
     out = SemanticOverlay().render(reader, {"output_topics": topics}, tmp_path)
 
     assert len(out) >= 1 and out[0].exists() and out[0].stat().st_size > 0
+
+
+# ── report Visualizations block + CLI entry points (§8, §2) ──────────────────
+
+
+def test_report_links_visualizations_when_present(tmp_path):
+    """generate_report renders a Visualizations block linking the mp4s when given."""
+    from replay.metrics.report.generator import generate_report
+
+    generate_report("perception", "run1", [], tmp_path, {},
+                    visualizations=["../viz/overlap_cam2_cam3.mp4", "../viz/combined_cam2.mp4"])
+    html = (tmp_path / "report.html").read_text()
+    assert "overlap_cam2_cam3.mp4" in html
+    assert "../viz/combined_cam2.mp4" in html
+
+
+def test_report_shows_hint_when_no_visualizations(tmp_path):
+    """With no viz, the report shows the `replay-module viz` hint, not links."""
+    from replay.metrics.report.generator import generate_report
+
+    generate_report("perception", "run1", [], tmp_path, {})
+    html = (tmp_path / "report.html").read_text()
+    assert "replay-module viz" in html
+
+
+def test_viz_subcommand_generates_videos(tmp_path):
+    """`replay-module viz` renders mp4s offline from an existing output bag."""
+    from click.testing import CliRunner
+    from replay.cli import main
+
+    bag, _ = _write_pair_bag(tmp_path / "bag", cams=(2, 3), n_frames=6)
+    out = tmp_path / "out"
+    res = CliRunner().invoke(
+        main, ["viz", "--module", "perception", "--bag", str(bag), "--output", str(out)])
+    assert res.exit_code == 0, res.output
+    assert list((out / "viz").glob("*.mp4")), res.output
+
+
+def test_metrics_run_viz_renders_and_links(tmp_path):
+    """`metrics --run-viz` renders viz AND the report links them (whatever the verdict)."""
+    from click.testing import CliRunner
+    from replay.cli import main
+
+    bag, _ = _write_pair_bag(tmp_path / "bag", cams=(2, 3), n_frames=6)
+    out = tmp_path / "out"
+    CliRunner().invoke(
+        main, ["metrics", "--module", "perception", "--bag", str(bag),
+               "--output", str(out), "--run-viz"])
+    assert list((out / "viz").glob("*.mp4"))
+    assert "../viz/" in (out / "reports" / "report.html").read_text()

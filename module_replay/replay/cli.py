@@ -76,6 +76,7 @@ def _run_metrics_pipeline(
     baseline: Optional[Path] = None,
     configs_dir: Path = DEFAULT_CONFIGS_DIR,
     run_artifacts: Optional[dict] = None,
+    run_viz: bool = False,
 ) -> int:
     """Run the registered perception plugins + faithfulness over an output bag,
     generate the report, and return the B9 exit code.
@@ -146,6 +147,18 @@ def _run_metrics_pipeline(
             )
         )
 
+    # Tier-3 viz (TIER3-VIZ-DESIGN §8): opt-in, CPU-only, rendered from the SAME
+    # output bag + cfg, lazily (the import only happens here, never on the cheap
+    # metrics path). Report-relative links (<output>/viz vs <output>/reports) are
+    # threaded into the report so the Visualizations block points at the mp4s. Viz
+    # NEVER affects the verdict/exit code (it is computed after the gate results).
+    visualizations = None
+    if run_viz:
+        from replay.metrics.viz_runner import render_visualizations
+
+        viz_paths = render_visualizations(module_spec.name, reader, cfg, output_dir)
+        visualizations = [f"../viz/{Path(p).name}" for p in viz_paths] or None
+
     reports_dir = output_dir / "reports"
     # Debug-section pointer map (01-16's run_artifacts): the bag, the persisted
     # run logs (<output>/logs/, written by runner.py 01-17), and the report
@@ -165,6 +178,7 @@ def _run_metrics_pipeline(
         thresholds=module_spec.thresholds,
         faithfulness=faithfulness,
         run_artifacts=run_artifacts,
+        visualizations=visualizations,
         # Tier-2 plots are DEFAULT on every run (the agreed scope — the report is
         # generated on every run anyway). Forwarding the reader is what triggers
         # generate_report's plot rendering; without it the report has no plots.
@@ -174,9 +188,10 @@ def _run_metrics_pipeline(
         rc = generate_report(**report_kwargs)
     except TypeError:
         # Graceful degrade: an older generate_report that predates the additive
-        # run_artifacts param (01-16). Drop it and render without the Debug
-        # pointer map rather than crash the run.
+        # run_artifacts / visualizations params. Drop them and render without the
+        # Debug pointer map / viz links rather than crash the run.
         report_kwargs.pop("run_artifacts", None)
+        report_kwargs.pop("visualizations", None)
         rc = generate_report(**report_kwargs)
     click.echo(f"Metrics report: {reports_dir / 'report.html'}")
     click.echo(f"Verdict: {_VERDICT_LABELS[rc]}")
@@ -421,20 +436,15 @@ def all_cmd(
         rc = _run_metrics_pipeline(
             module_spec, result.output_bag_path, output_dir,
             baseline=baseline, configs_dir=configs_dir,
-            run_artifacts=run_artifacts,
+            run_artifacts=run_artifacts, run_viz=run_viz,
         )
         if rc != 0:
             sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
-    if run_viz:
-        # Scope-honest deferral (UAT gap 7): SC1 advertises --run-viz, but the
-        # CI gate reads metrics.json (not images), so the developer visualizations
-        # are deferred to a later phase rather than shipped as a silent no-op.
-        # NOTE: --run-viz becomes the Tier-3 local-viz entry point in a later
-        # phase (out of scope for 01-17 — this plan only persists+surfaces logs).
-        click.echo(
-            "--run-viz: visualization is deferred to a later phase "
-            "(the CI gate reads metrics.json, not images)."
-        )
+    elif run_viz:
+        # --run-viz WITHOUT --run-metrics: render the Tier-3 videos standalone
+        # from the output bag (no report/gate). Viz is CPU-only and never affects
+        # any exit code (TIER3-VIZ-DESIGN §9).
+        _run_viz_pipeline(module_spec, result.output_bag_path, output_dir)
 
 
 @main.command("metrics")
@@ -451,9 +461,11 @@ def all_cmd(
     "BaselineManager (configs/baselines/<module>/golden.yaml -> S3). Without it the "
     "regression metric is a visible warning-only 'skipped' row.",
 )
+@click.option("--run-viz", is_flag=True, default=False,
+              help="Also render the Tier-3 debug videos ([viz] extra) and link them in the report.")
 def metrics_cmd(
     module: str, bag_path: Path, output_dir: Path, configs_dir: Path,
-    baseline: Optional[Path],
+    baseline: Optional[Path], run_viz: bool,
 ) -> None:
     """Offline evaluation of an EXISTING output bag: plugins -> criteria -> report + exit code.
 
@@ -464,14 +476,60 @@ def metrics_cmd(
     Pass ``--baseline <golden-bag>`` to run the regression metric
     (``mask_iou_vs_golden``) via compare(); without it that metric is a visible
     warning-only "skipped" row (UAT gap 2 / plan 01-15).
+
+    Pass ``--run-viz`` to ALSO render the Tier-3 debug videos (needs the ``[viz]``
+    extra). Viz is opt-in, CPU-only, and never affects the verdict/exit code
+    (TIER3-VIZ-DESIGN §9).
     """
     module_spec = load_module_config(module, configs_dir / "modules")
     output_dir.mkdir(parents=True, exist_ok=True)
     rc = _run_metrics_pipeline(
         module_spec, bag_path, output_dir, baseline=baseline, configs_dir=configs_dir,
+        run_viz=run_viz,
     )
     if rc != 0:
         sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
+
+
+def _run_viz_pipeline(module_spec, bag_path: Path, output_dir: Path) -> list:
+    """Render a module's Tier-3 viz from an EXISTING output bag (no replay/gate).
+
+    Shared by the standalone ``viz`` subcommand and ``all --run-viz`` (without
+    metrics). Builds the same read-once ``BagReader`` + metrics cfg the plugins
+    expect, then defers to the lazy ``render_visualizations`` runner.
+    """
+    from replay.metrics.bag_reader import BagReader
+    from replay.metrics.viz_runner import render_visualizations
+
+    topics = list(module_spec.input_topics) + list(module_spec.output_topics)
+    reader = BagReader(bag_path, topics)
+    cfg = _build_metrics_cfg(module_spec)
+    paths = render_visualizations(module_spec.name, reader, cfg, output_dir)
+    if paths:
+        click.echo(f"Generated {len(paths)} visualization(s) in {Path(output_dir) / 'viz'}:")
+        for p in paths:
+            click.echo(f"  {p}")
+    else:
+        click.echo("No visualizations generated (see message above).")
+    return paths
+
+
+@main.command("viz")
+@click.option("--module", required=True, type=click.Choice(["perception", "navigation", "manipulation"]))
+@click.option("--bag", "bag_path", required=True, type=click.Path(path_type=Path, exists=True))
+@click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
+@click.option("--configs-dir", type=click.Path(path_type=Path, exists=True), default=DEFAULT_CONFIGS_DIR)
+def viz_cmd(module: str, bag_path: Path, output_dir: Path, configs_dir: Path) -> None:
+    """Render Tier-3 debug videos offline from an EXISTING output bag.
+
+    CPU-only, no replay/Docker/GPU/gate (TIER3-VIZ-DESIGN §2). Writes
+    ``<output>/viz/*.mp4`` (overlap_video + the per-camera combined grid). Needs the
+    ``[viz]`` extra (``pip install module_replay[viz]``); a missing encoder prints an
+    install hint and exits cleanly without affecting anything else.
+    """
+    module_spec = load_module_config(module, configs_dir / "modules")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _run_viz_pipeline(module_spec, bag_path, output_dir)
 
 
 if __name__ == "__main__":

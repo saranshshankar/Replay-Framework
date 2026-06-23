@@ -160,7 +160,7 @@ def test_metrics_json_schema_unchanged(tmp_path):
     # Only the additive keys joined the top level:
     assert set(doc) - {
         "module", "run_id", "pass", "replay_faithfulness", "metrics", "verdict", "details",
-    } <= {"summary", "run_artifacts", "overlap_pairs", "plots"}
+    } <= {"summary", "run_artifacts", "overlap_pairs", "plots", "visualizations"}
     # Types intact — the CI gate reads doc["pass"]/doc["verdict"]/the rows:
     assert isinstance(doc["pass"], bool) and doc["pass"] is True
     assert doc["verdict"] in {"PASS", "FAIL", "INVALID"}

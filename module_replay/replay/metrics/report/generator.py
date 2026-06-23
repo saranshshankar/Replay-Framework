@@ -143,6 +143,7 @@ def generate_report(
     faithfulness: Optional[dict] = None,
     run_artifacts: Optional[dict] = None,
     reader=None,
+    visualizations: Optional[list] = None,
 ) -> int:
     """Evaluate metrics vs thresholds, AND-gate quality, write artifacts, return the B9 exit code.
 
@@ -305,6 +306,9 @@ def generate_report(
         "summary": summary,
         "run_artifacts": run_artifacts,
         "overlap_pairs": overlap_pairs,
+        # Tier-3 viz (additive, never gated): report-relative mp4 links when the
+        # --run-viz / viz path produced them, else None -> the template shows a hint.
+        "visualizations": visualizations,
     }
     # metrics.json is the machine-read gate signal (CI reads doc["pass"] / verdict).
     # json.dumps cannot be HTML-injected, so the values pass through untransformed.

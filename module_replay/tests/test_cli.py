@@ -752,9 +752,10 @@ def test_run_metrics_pipeline_passes_run_artifacts(tmp_path: Path, synthetic_bag
     assert "bag" in run_artifacts
 
 
-def test_run_viz_states_deferred(tmp_path: Path, mocker):
-    """01-10 / UAT gap 7: --run-viz states viz is deferred to a later phase
-    (scope-honest), NOT the old 'not implemented yet' no-op echo."""
+def test_all_run_viz_invokes_viz_pipeline(tmp_path: Path, mocker):
+    """Tier-3 (TIER3-VIZ-DESIGN): --run-viz on `all` (without --run-metrics) now
+    RENDERS the debug videos via the viz pipeline — no longer the old scope-honest
+    'deferred' no-op echo (01-10 / UAT gap 7 is closed)."""
     from replay.runner import RunResult
 
     bag = tmp_path / "bag"
@@ -766,6 +767,9 @@ def test_run_viz_states_deferred(tmp_path: Path, mocker):
         "replay.cli.run_replay",
         return_value=RunResult(output_bag_path=bag, exit_code=0),
     )
+    # The viz render itself is unit-tested in test_viz.py; here we assert the `all`
+    # command WIRES --run-viz to the viz pipeline (no real bag decode needed).
+    spy = mocker.patch("replay.cli._run_viz_pipeline", return_value=[bag / "viz" / "x.mp4"])
     r = CliRunner().invoke(
         main,
         [
@@ -777,5 +781,5 @@ def test_run_viz_states_deferred(tmp_path: Path, mocker):
         ],
     )
     assert r.exit_code == 0, r.output
-    assert "deferred" in r.output
-    assert "not implemented yet" not in r.output
+    spy.assert_called_once()
+    assert "deferred" not in r.output

@@ -33,16 +33,30 @@ specific run when they want to debug — **not** auto-on-failure, and **not** pa
 
 ## 3. Scope
 
+Both are **faithful V2 revamps of Aniket's PoC viz** (`origin/aniket/feat/module_wise_replay_poc:
+module_wise_replay/perception_metrics/visualizations/{overlap_video,semantic_overlay}.py`) — same
+panel layouts, legends, agreement badge, and color map — rewired off the PoC `BagReader`/constants
+onto V2 (decision 2026-06-23: "use Aniket's branch, revamp to V2").
+
 **In (first cut):**
-- `overlap_video` — the 4-pane cross-camera video with AKAZE feature-match lines + per-frame
-  semantic-agreement %. Reuses the homography/warp/agreement geometry already in `overlap.py`
-  (the 01-14 rewrite), rewired to V2 (`BagReader`, `_sim` cams 0–5, AKAZE not lightglue, stamp-join).
-- `semantic_overlay` — per-camera rgba8 semantic mask (R = class-id) colorized + alpha-blended over
-  the `image_raw_sim` RGB, encoded as a per-camera video.
+- `overlap_video` — Aniket's per-pair **2×2** cross-camera video: top row = both RGB side-by-side
+  with AKAZE feature-match lines; bottom row = each camera's semantic-overlap region alpha-blended
+  on its RGB; header carries the per-frame semantic-agreement % + a PASS/FAIL badge; class legend.
+  Reuses `overlap.py`'s geometry helpers (`_match_akaze` → `_compute_homography` →
+  `_scale_homography_to_semantic` → `_compute_overlap_mask` → `_compute_semantic_agreement`),
+  rewired to V2 (`BagReader.get_messages`/`iter_paired`, `_sim` cams via `_camera_topic_map`, AKAZE
+  not lightglue, `header.stamp` join). The metric does NOT expose calibration, so the viz
+  **recomputes** H/masks per pair from a sampled frame pair using those same helpers.
+- `semantic_overlay` — Aniket's per-camera **2×2 combined grid**: RGB | Semantic-colored |
+  Depth-heatmap (turbo) | Temporal-diff (sem vs prev frame + a consistency %), encoded as a
+  per-camera mp4. Decodes `image_raw_sim` (rgb8), `semantic_raw_sim` (rgba8, R = class-id, via
+  `_decode_classid_plane`), and `depth_raw_sim` (32FC*/16UC*, the V2 depth encoding per `depth.py`).
 - The three entry points above + the `[viz]` extra + the report Visualizations block.
 
-**Deferred (YAGNI):** `temporal_filmstrip`; `publish_latency_bokeh` (the Tier-2 static latency plot
-covers most of its value); auto-generate-on-failure (`workflow_run`); other modules' viz (Phase 2+).
+**Deferred (YAGNI):** the **standalone** `temporal_filmstrip`, `depth_heatmap`, and
+`depth_reprojection_viz` plugins (their value is absorbed into the `semantic_overlay` grid's
+temporal-diff + depth quadrants); `publish_latency_bokeh` (the Tier-2 static latency plot covers
+most of its value); auto-generate-on-failure (`workflow_run`); other modules' viz (Phase 2+).
 
 ## 4. Architecture
 
@@ -57,26 +71,51 @@ module_replay/replay/metrics/perception/viz/
 module_replay/replay/metrics/viz_runner.py   # render_visualizations(reader, cfg, output_dir) -> list[Path]
 ```
 
-`render_visualizations` iterates `get_viz_plugins(module)`; each plugin writes its `.mp4`(s) into
-`<output>/viz/` and returns the paths. Per-plugin failures are caught and logged — one bad plugin
-never aborts the others or the caller.
+`render_visualizations(reader, config, output_dir)` iterates `get_viz_plugins(module)`; each plugin
+writes its `.mp4`(s) into `<output>/viz/` and returns the paths. Per-plugin failures are caught and
+logged — one bad plugin never aborts the others or the caller.
 
-## 5. The two visualizations (V2-rewired)
+**ABC signature (correction).** `BaseVisualization.render` currently takes `(reader, metrics, output_dir)`,
+but the plugins need the **module config** (to map camera index → output topic via
+`_camera_topic_map(output_topics, suffix)`, plus the palette/topic names) — not the metrics dict.
+Since `_VIZ_REGISTRY` has zero implementations today, refine the ABC to
+`render(self, reader: BagReader, config: dict, output_dir: Path) -> list[Path]`. `config` is the
+same `_build_metrics_cfg(module_spec)` dict the metric plugins already receive.
 
-Both read the **output bag** via the framework `BagReader`, join frames by `header.stamp`, and decode
-the real V2 encodings (`image_raw_sim` rgb8; `semantic_raw_sim` rgba8 with R = class-id).
+## 5. The two visualizations (V2-rewired from Aniket's PoC)
 
-- **overlap_video** — for each `OVERLAP_PAIRS` adjacency: compute the AKAZE homography on the RGB
-  pair (the same calibrate step `overlap.py` already does), warp the class-id mask, draw the match
-  lines + the overlap region + the per-frame agreement %, tile into the 4-pane frame, encode mp4.
-  Reuses `overlap.py`'s geometry helpers (no duplicate CV logic).
-- **semantic_overlay** — per camera: colorize the class-id plane via a fixed palette, alpha-blend
-  over the RGB frame, encode a per-camera mp4.
+Both read the **output bag** via the framework `BagReader` (`get_messages`/`iter_paired`), join
+frames by `header.stamp`, and decode the real V2 encodings (`image_raw_sim` rgb8;
+`semantic_raw_sim` rgba8 with R = class-id via `_decode_classid_plane`; `depth_raw_sim` 32FC*/16UC*).
+Camera index → topic comes from `_camera_topic_map(config['output_topics'], suffix)`, NOT PoC
+constants. Frame dimensions are read from the decoded arrays, NOT hardcoded.
+
+- **overlap_video** (Aniket's `generate_overlap_videos`, V2-rewired) — for each `OVERLAP_PAIRS`
+  adjacency present in the configured cams: sample a frame pair, `_to_gray` → `_match_akaze` →
+  `_compute_homography` → `_scale_homography_to_semantic` → `_compute_overlap_mask` to **recompute**
+  the per-pair calibration (the metric doesn't return it). Then drive over cam-A RGB frames,
+  stamp-joining cam-B RGB + both semantics, and for each frame draw Aniket's 2×2: top = both RGB
+  with match lines, bottom = each cam's semantic-overlap blended on RGB; header = agreement % +
+  PASS/FAIL badge; class legend.
+- **semantic_overlay** (Aniket's `generate_combined_videos`, V2-rewired) — per camera, a 2×2 grid:
+  RGB | semantic-colored (palette over class-id) | depth heatmap (turbo, percentile-normalized) |
+  temporal-diff (sem vs prev frame + consistency %). Depth is stamp-matched with a hold tolerance;
+  cameras without depth show an "N/A" quadrant.
+
+**Encoder (deliberate deviation from the PoC).** Aniket encodes with `cv2.VideoWriter(*"mp4v")`,
+which on headless OpenCV wheels can silently emit a 0-byte file (his code even guards with a
+`st_size > 0` check). The V2 revamp keeps his frame *composition* verbatim (cv2 drawing into RGB
+numpy frames) but writes via **`imageio[ffmpeg]`** (`get_writer(...).append_data(rgb)`), which
+bundles a known-good ffmpeg and takes RGB directly (dropping the final `cvtColor RGB→BGR`). This is
+why `[viz]` carries a real new dependency and why the "non-empty mp4" test is reliable in CI.
 
 ## 6. Dependency isolation
 
-- New optional extra **`[viz]` = `imageio[ffmpeg]`** (pip-only mp4 encoder; `cv2` and `matplotlib`
-  are already in `[metrics]` via AKAZE / Tier-2 plots, so the *only* new dependency is the encoder).
+- New optional extra **`[viz]` = `imageio[ffmpeg]` + `bokeh`** (`cv2` and `matplotlib` are already in
+  `[metrics]` via AKAZE / Tier-2 plots, so the only genuinely-new encode dependency is
+  `imageio[ffmpeg]`). **`bokeh` MOVES here from `[metrics]`** — it only ever served the deferred
+  interactive viz (`publish_latency_bokeh`), so it was dead weight bloating the cheap metrics
+  install; relocating it to `[viz]` enforces this design's own lean-metrics principle.
 - The `viz/` package + `viz_runner` are **lazily imported only on the viz path**. The cheap metrics
   pipeline never imports them, so the CI metrics job (`pip install ...[metrics]`) stays lean and a
   missing encoder can never break a metrics run.

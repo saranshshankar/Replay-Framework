@@ -124,7 +124,11 @@ mocks: []
 
 preflight_assets:
   # host-side paths (the ~/.ros bind-mount source + the 10xCode tree); checked fail-fast before replay
-  - ~/.ros/perception/models/L2_L4_segformer_B1_x86_b6_fp16.trt
+  # EoMT engine — validated present in S3 (10xai-team-models/segmentation/semantic14/, 2026-06-19);
+  # this is what the e2e ran. NOTE: 10xCode dev's perception_sim.yaml still names the OLD
+  # L2_L4_segformer (not in the model bucket) — that sim config must be repointed at
+  # flicker_drywall.trt for the node to ACTIVATE (model-currency open item, perception team).
+  - ~/.ros/perception/models/flicker_drywall.trt
   - ~/.ros/perception/calibration/camera_intrinsics/fisheye_rear/luts
   - ~/.ros/perception/calibration/camera_intrinsics/fisheye_top/luts
   - ~/.ros/perception/calibration/camera_intrinsics/fisheye_ft/luts

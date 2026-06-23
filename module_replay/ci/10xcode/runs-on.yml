@@ -1,0 +1,26 @@
+# DEPLOY TO: 10xCode  ->  .github/runs-on.yml
+# RunsOn custom runner profiles for ephemeral EC2 GPU runners (runs-on.com).
+# Modeled on OriginAutonomy/10xSim#453 (sim-gpu profile). Docs: https://runs-on.com/docs/runners/labels/
+#
+# A workflow job asks for one of these with:
+#   runs-on: runs-on=${{ github.run_id }}/runner=<profile-name>
+# RunsOn then boots a fresh EC2 instance for that job and destroys it when the job ends.
+
+runners:
+  # GPU runner for the perception replay gate.
+  # g6 family = NVIDIA L4 (Ada, compute capability sm_89) — the SAME GPU arch as the
+  # dev-box RTX 4080, so the prebuilt FP16 TensorRT engine deserializes without a rebuild.
+  # (10xSim uses g6e/L40S for sim; perception replay needs far less VRAM, so L4 is enough.)
+  replay-gpu:
+    family: ["g6"]                 # L4; g6.4xlarge => 16 vCPU / 64 GiB (vCPU count set by `cpu`)
+    image: ubuntu24-gpu-x64        # RunsOn base image: NVIDIA drivers preinstalled
+    cpu: [16]                      # the colcon build of the module is CPU-bound
+    spot: false                    # on-demand: guaranteed GPU capacity for a blocking PR gate
+    volume: 250gb                  # ~20 GB toolchain image + ~25 GB output bag + build tree
+    extras: s3-cache+ecr-cache     # s3-cache: pip/Actions cache; ecr-cache: Docker layer cache so
+                                   # the 20 GB planner image only fully downloads when it changes
+  # Input persistence (see CI-ENABLEMENT-GUIDE Part 10): the engine (~54 MiB) + LUTs + bag are
+  # NOT baked in — the workflow downloads them from S3 into ~/.ros at job start (seconds). A
+  # custom AMI is NOT recommended for these small assets (maintenance > benefit). Only consider
+  # one if the multi-GB BAG download ever dominates wall-clock; then bake just the bag via:
+  #   image: my-replay-gpu-ami   # custom image name, or:  ami: ami-0123456789abcdef0

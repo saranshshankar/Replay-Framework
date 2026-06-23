@@ -1,0 +1,84 @@
+# DEPLOY TO: 10xCode  ->  .github/workflows/replay-perception-nightly.yml
+#
+# CI-02 nightly smoke + SC4 determinism, running inside 10xCode CI on a RunsOn GPU runner.
+# Replays one fixed perception bag against 10xCode dev and asserts green; then replays it a
+# SECOND time and asserts every metric's |delta| stays within its tolerance_band (determinism).
+name: replay-perception-nightly
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write        # AWS OIDC — S3-read only, to download the asset bundle
+  contents: read
+  packages: read         # GHCR image pull
+
+jobs:
+  smoke:
+    runs-on: runs-on=${{ github.run_id }}/runner=replay-gpu
+    env:
+      MODULE: perception
+      REGISTRY: ghcr.io/originautonomy
+      TENXCODE_ROOT: ${{ github.workspace }}
+      BAG: ${{ vars.PERCEPTION_BAG_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }            # 10xCode dev HEAD
+      - uses: actions/checkout@v4
+        with:
+          repository: saranshshankar/Replay-Framework
+          ref: main
+          path: replay-framework
+          token: ${{ secrets.FRAMEWORK_READ_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.DOCKER_DEPLOYMENT_PAT }}
+      - run: pip install -e "./replay-framework/module_replay[metrics]"
+      # Stage runtime assets into ~/.ros (engine/LUTs not in the image — guide Part 10)
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.REPLAY_ROLE_ARN }}", aws-region: us-east-1 }
+      - name: Stage engine + LUTs + bag into ~/.ros
+        run: |
+          mkdir -p ~/.ros/perception/models ~/.ros/perception/calibration/camera_intrinsics
+          # x86/sm_89/TRT-10.3 engine — NOT the ARM s3://10xai-team-models/.../flicker_drywall.trt (guide Part 5a)
+          aws s3 cp "${{ vars.PERCEPTION_ENGINE_S3 }}" ~/.ros/perception/models/flicker_drywall.trt
+          aws s3 sync --region us-east-1 \
+            s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/ \
+            ~/.ros/perception/calibration/camera_intrinsics/
+          aws s3 sync --region us-east-1 "${{ vars.PERCEPTION_BAG_S3 }}" "$BAG"
+
+      - name: Smoke replay one fixed bag + assert green
+        run: |
+          cd replay-framework/module_replay
+          replay-module all --module "$MODULE" --local-bag "$BAG" --output /tmp/nightly --run-metrics
+          python -c "import json,sys; d=json.load(open('/tmp/nightly/reports/metrics.json')); sys.exit(0 if d['pass'] else 1)"
+
+      - name: Determinism — second replay, per-metric |delta| within tolerance_band (SC4)
+        run: |
+          cd replay-framework/module_replay
+          replay-module all --module "$MODULE" --local-bag "$BAG" --output /tmp/nightly2 --run-metrics
+          python - <<'EOF'
+          import json, sys
+          a = json.load(open('/tmp/nightly/reports/metrics.json'))
+          b = json.load(open('/tmp/nightly2/reports/metrics.json'))
+          ra = {m['name']: m for m in a['metrics'] if m.get('value') is not None}
+          rb = {m['name']: m for m in b['metrics'] if m.get('value') is not None}
+          bad = []
+          for n in ra.keys() & rb.keys():
+              tol = ra[n].get('tolerance_band') or 0.0
+              d = abs(float(ra[n]['value']) - float(rb[n]['value']))
+              if d > tol: bad.append(f"{n}: |delta|={d:.4f} > tol={tol}")
+          print("deltas:", {n: abs(float(ra[n]['value'])-float(rb[n]['value'])) for n in ra.keys() & rb.keys()})
+          sys.exit(1 if bad else 0)
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-${{ github.run_id }}
+          path: /tmp/nightly
+          retention-days: 5

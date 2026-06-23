@@ -1,0 +1,165 @@
+# DEPLOY TO: 10xCode  ->  .github/workflows/replay-perception-gate.yml
+#
+# The Module-wise Replay regression gate for perception, running INSIDE 10xCode CI.
+# The replay framework (saranshshankar/Replay-Framework) is imported as a LIBRARY: this
+# workflow checks it out, pip-installs it, and runs it against THIS PR's perception code.
+#
+#   on PR touching perception  ->  replay (RunsOn GPU)  ->  metrics (cheap CPU)  ->  gate
+#
+# DETECTION (CI-05) is the `paths:` filter below — the whole workflow only fires when a
+# perception source path changes, so no separate detect job is needed.
+# SECURITY: safe `pull_request` event (no secret-bearing target variant; T-08-01). AWS auth
+# is OIDC only (id-token: write); the metrics + gate jobs hold no secrets and no GPU.
+name: replay-perception-gate
+
+on:
+  pull_request:
+    paths:
+      - 'perception/v2/realtime_perception/**'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write        # AWS OIDC — S3-READ ONLY, to download the asset bundle (engine/LUTs/bag)
+  contents: read
+  packages: read         # GHCR image pull (10xCode's primary registry)
+  pull-requests: write   # to surface the report
+
+jobs:
+  replay:
+    # RunsOn boots a fresh ephemeral L4 GPU EC2 instance for this job (profile in
+    # .github/runs-on.yml) and destroys it at the end — native ephemerality (T-08-04).
+    runs-on: runs-on=${{ github.run_id }}/runner=replay-gpu
+    env:
+      MODULE: perception
+      FRAMEWORK_REF: main                          # pin a tag for reproducibility once cut
+      REGISTRY: ghcr.io/originautonomy             # GHCR = 10xCode's primary registry (v2-docker-ci.yml)
+      TENXCODE_ROOT: ${{ github.workspace }}       # the framework operates on THIS checkout
+      BAG: ${{ vars.PERCEPTION_BAG_PATH }}         # e.g. /mnt/efs/bags/perception_ci (Part 10)
+    steps:
+      - name: Checkout 10xCode PR (with submodules)
+        uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: Checkout the replay framework (imported as a library)
+        uses: actions/checkout@v4
+        with:
+          repository: saranshshankar/Replay-Framework
+          ref: ${{ env.FRAMEWORK_REF }}
+          path: replay-framework
+          token: ${{ secrets.FRAMEWORK_READ_TOKEN }}   # read-only PAT (cross-org until repo moves in)
+
+      # Log in to GHCR so `docker compose up --pull missing` can pull the planner image.
+      # DOCKER_DEPLOYMENT_PAT is the org's EXISTING GHCR credential (the same one
+      # v2-docker-ci.yml uses to push) — no AWS, no new secret. ECR is only a robot mirror.
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.DOCKER_DEPLOYMENT_PAT }}
+
+      - name: Install the framework
+        run: pip install -e "./replay-framework/module_replay[metrics]"
+
+      # The engine (~54 MiB) + LUTs are NOT in the Docker image — they are runtime assets the
+      # container reads from the host ~/.ros (bind-mounted to /root/.ros). Download them per-run
+      # (seconds) instead of maintaining a custom AMI (guide Part 10). Source = the S3 fixtures
+      # bundle (Q-K); needs only an S3-READ OIDC role — NOT ECR (the image is GHCR).
+      - name: Configure AWS (S3 READ on the asset buckets)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.REPLAY_ROLE_ARN }}   # read on 10xai-team-models + rosbags-10x
+          aws-region: us-east-1
+      - name: Stage engine + LUTs into ~/.ros (bind-mounted into the container)
+        run: |
+          mkdir -p ~/.ros/perception/models ~/.ros/perception/calibration/camera_intrinsics
+          # Engine (EoMT). WARNING: s3://10xai-team-models/segmentation/semantic14/flicker_drywall.trt
+          # is an ARM/Orin build — it will NOT deserialize on the x86 L4. Do NOT use it.
+          # PERCEPTION_ENGINE_S3 must point at an x86 / sm_89 / TRT-10.3 build of the SAME model,
+          # built once from the ONNX (guide Part 5a) and uploaded. aws s3 cp auto-resolves region.
+          aws s3 cp "${{ vars.PERCEPTION_ENGINE_S3 }}" ~/.ros/perception/models/flicker_drywall.trt
+          # LUTs: the bucket path has NO 'calibration/' segment, but SIM needs one — remap into
+          # perception/calibration/camera_intrinsics/ (perception_sim.yaml:64). 6 cams (~85MB ea).
+          aws s3 sync --region us-east-1 \
+            s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/ \
+            ~/.ros/perception/calibration/camera_intrinsics/
+          # Input bag — NOT in either prefix above; point PERCEPTION_BAG_S3 at the curated bag.
+          aws s3 sync --region us-east-1 "${{ vars.PERCEPTION_BAG_S3 }}" "$BAG"
+
+      - name: Verify GPU is visible
+        run: nvidia-smi
+
+      # Pin the framework's version-spec to THIS PR's commit. The 10xCode tree is already
+      # checked out at this SHA, so the framework's internal `git checkout` is a no-op that
+      # preserves the PR's edits (e2e-2026-06-18, fix F5), then it builds + replays them.
+      - name: Pin replay to this PR's commit
+        run: |
+          cat > /tmp/version.yaml <<EOF
+          tenxcode:
+            branch: ${{ github.event.pull_request.head.sha || github.sha }}
+          EOF
+
+      - name: Replay this PR's perception (replay only — metrics run on the cheap job, CI-01)
+        run: |
+          cd replay-framework/module_replay
+          replay-module all --module "$MODULE" \
+            --version-yaml /tmp/version.yaml \
+            --local-bag "$BAG" \
+            --output /tmp/output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: output-bag-${{ github.run_id }}
+          path: /tmp/output/replay_output
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
+        if: always()                               # logs are the failure evidence
+        with:
+          name: logs-${{ github.run_id }}
+          path: /tmp/output/logs
+          retention-days: 5
+
+  metrics:
+    needs: replay
+    runs-on: ubuntu-latest                         # cheap; no GPU, no ROS, no secrets
+    steps:
+      - name: Checkout the framework (metrics only)
+        uses: actions/checkout@v4
+        with:
+          repository: saranshshankar/Replay-Framework
+          ref: main
+          token: ${{ secrets.FRAMEWORK_READ_TOKEN }}
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e "./module_replay[metrics]"
+      - uses: actions/download-artifact@v4
+        with:
+          name: output-bag-${{ github.run_id }}
+          path: /tmp/output/replay_output
+      - name: Compute metrics + gate on the verdict
+        run: |
+          cd module_replay
+          replay-module metrics --module perception \
+            --bag /tmp/output/replay_output --output /tmp/metrics
+          python -c "import json,sys; d=json.load(open('/tmp/metrics/reports/metrics.json')); sys.exit(0 if d['pass'] else 1)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-${{ github.run_id }}
+          path: /tmp/metrics/reports
+          retention-days: 5
+
+  gate:
+    needs: [replay, metrics]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Single required check for branch protection
+        run: |
+          {
+            echo "### Perception replay gate"
+            echo "Artifacts (5-day retention) on [this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}):"
+            echo "- \`logs-${{ github.run_id }}\` — recorder.log + module.log (look here first on a failure)"
+            echo "- \`report-${{ github.run_id }}\` — report.html + metrics.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ needs.replay.result }}" = "success" ] && [ "${{ needs.metrics.result }}" = "success" ] || exit 1

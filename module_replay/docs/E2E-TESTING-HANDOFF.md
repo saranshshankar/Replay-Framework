@@ -188,23 +188,28 @@ module_replay/.venv/bin/replay-module all --module perception --local-bag <bag> 
 tolerance bands and why `mask_iou_vs_golden`'s floor is 0.98, not 1.0. If two runs diverge by more
 than the band, that's a real finding — report it.
 
-### SC2 / SC3 — CI gate red/green + nightly (GitHub Actions on a self-hosted GPU runner)
+### SC2 / SC3 — CI gate red/green + nightly (Path A: GitHub Actions inside 10xCode, RunsOn GPU)
 
-These need the GPU box registered as a **self-hosted GitHub Actions runner** + repo vars/secrets:
-- `vars.ECR_ROLE_ARN` (OIDC role for ECR pull — no long-lived keys), the perception CI bag, and the
-  S3 schema (platform-team items Q-F/Q-J/Q-K).
-- Workflows: `.github/workflows/replay-gate.yml` (PR gate: detect touched module → GPU replay →
-  cheap-runner metrics → summary gate), `.github/workflows/replay-nightly.yml` (cron smoke +
-  second-replay determinism), `.github/workflows/lint-and-test.yml` (unit suite).
+The gate runs **inside 10xCode's CI** with this framework imported as a library; the deployable
+templates live in `module_replay/ci/10xcode/` and `docs/CI-ENABLEMENT-GUIDE.md` is the deploy runbook.
+These need the platform-team items (Q-F/Q-J/Q-K):
+- **RunsOn on OriginAutonomy** (ephemeral L4 GPU; the `replay-gpu` profile in `runs-on.yml`) — not a
+  babysat self-hosted box.
+- **`DOCKER_DEPLOYMENT_PAT`** for the GHCR image pull (the org's existing credential; no AWS) + an
+  **S3-read OIDC role** (`REPLAY_ROLE_ARN`) for the runtime assets (engine/LUTs/bag). ECR is not used.
+- the curated perception CI bag + the S3 schema.
+- Templates (deploy into 10xCode `.github/`): `replay-perception-gate.yml` (PR gate: `paths:`-filter
+  detection → RunsOn GPU replay → cheap-runner metrics → summary gate) and `replay-perception-nightly.yml`
+  (cron smoke + second-replay determinism). `lint-and-test.yml` (unit suite) stays in this framework repo.
 
 **SC2 success:** open a PR that makes perception breach a criterion (e.g. forces latency > 50 ms or
 overlap < 0.75) → the `gate` job goes **red** and blocks; a clean PR's `gate` job is **green**.
 Make the `gate` job a required check in branch protection.
 
-**SC3 success:** `replay-nightly.yml` (scheduled or `workflow_dispatch`) replays the one fixed
+**SC3 success:** `replay-perception-nightly.yml` (scheduled or `workflow_dispatch`) replays the one fixed
 perception bag, evaluates it, and exits green.
 
-> If the self-hosted runner / ECR role / CI bag aren't provisioned yet, SC2/SC3 are blocked on the
+> If RunsOn / the S3-read role / CI bag aren't provisioned yet, SC2/SC3 are blocked on the
 > platform team — validate SC1 + SC4 locally first and report SC2/SC3 as infra-pending.
 
 ---

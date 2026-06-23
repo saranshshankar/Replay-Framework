@@ -54,5 +54,10 @@ class BaseRegressionMetric(BaseMetric):
 
 
 class BaseVisualization(ABC):
+    # Tier-3 viz plugin seam (TIER3-VIZ-DESIGN.md). ``config`` is the same
+    # ``_build_metrics_cfg(module_spec)`` dict the metric plugins receive — the
+    # plugins need it to map camera index -> output topic (``_camera_topic_map``)
+    # and to read the configured topics. (Refined from an earlier ``metrics`` arg
+    # before any plugin existed: viz renders from the bag + config, not verdicts.)
     @abstractmethod
-    def render(self, reader: "BagReader", metrics: dict, output_dir: Path) -> list[Path]: ...
+    def render(self, reader: "BagReader", config: dict, output_dir: Path) -> list[Path]: ...

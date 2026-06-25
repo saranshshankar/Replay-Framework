@@ -115,7 +115,7 @@ class SemanticOverlay(BaseVisualization):
                     prev_sem = sem.copy()
                     if writer is None:
                         writer = imageio.get_writer(str(out_path), fps=fps,
-                                                    macro_block_size=1)
+                                                    macro_block_size=16)  # /16 auto-pad for player compatibility (QuickTime/Safari/PowerPoint)
                     writer.append_data(frame)
             finally:
                 if writer is not None:

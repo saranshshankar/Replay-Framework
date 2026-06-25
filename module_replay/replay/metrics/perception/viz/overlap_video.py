@@ -251,7 +251,7 @@ class OverlapVideo(BaseVisualization):
                     )
                     if writer is None:
                         writer = imageio.get_writer(str(out_path), fps=fps,
-                                                    macro_block_size=1)
+                                                    macro_block_size=16)  # /16 auto-pad → players (QuickTime/Safari) accept non-/16 frames (e.g. 448x484→448x496)
                     writer.append_data(frame)
             finally:
                 if writer is not None:

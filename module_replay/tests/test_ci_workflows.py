@@ -1,12 +1,30 @@
-"""CI workflow hardening + security-invariant regression guard (plan 01-18).
+"""CI workflow hardening + security-invariant regression guard (plan 01-18 / repointed 01.1-03).
 
-These tests parse the two GitHub Actions workflows with ``yaml.safe_load`` and
-pin both the NEW debuggability behavior (logs uploaded, every artifact
-ephemeral via ``retention-days: 5``, a developer-facing artifact link) AND the
-pre-existing CI security invariants (``pull_request`` only — never
-``pull_request_target``; OIDC-only AWS auth with no long-lived keys; every
-``uses:`` pinned to a concrete ref; minimal permissions) so a future edit
-cannot silently regress them (T-18-01..T-18-05).
+These tests parse the GitHub Actions workflow templates with ``yaml.safe_load``
+and pin both the debuggability behavior (logs uploaded, every artifact ephemeral
+via ``retention-days: 5``, a developer-facing artifact link) AND the CI security
+invariants (``pull_request`` only — never ``pull_request_target``; OIDC-only AWS
+auth with no long-lived keys; every ``uses:`` pinned to a concrete ref; minimal
+permissions) so a future edit cannot silently regress them (T-18-01..T-18-05).
+
+REPOINT (plan 01.1-03): When Path-A (commit 1d6ad25) moved the gate/nightly
+templates from ``.github/workflows/`` into ``module_replay/ci/10xcode/``, the
+original ``skipif`` keyed off the deleted ``.github/workflows/replay-gate.yml``
+and made all 14 tests silently skip.  This file now points WORKFLOWS_DIR at
+``module_replay/ci/10xcode/`` and covers:
+  - replay-perception-gate.yml    (GATE)
+  - replay-perception-nightly.yml (NIGHTLY)
+  - replay-perception-viz.yml     (VIZ — path resolved; own security test in
+                                    test_viz.py; not re-covered here)
+
+Path-A nightly note: the nightly bundles all run artefacts (reports + logs +
+bag) into ONE ``nightly-<run_id>`` directory at /tmp/nightly (a single
+upload-artifact step).  There are NO separate ``report``/``logs``/``bag`` upload
+paths.  ``test_nightly_uploads_artifacts`` is rewritten to assert the real
+Path-A shape.
+
+Plan 06 will extend this file to add sweep-template + merge-fragment coverage;
+WORKFLOWS_DIR is resolved from ci/10xcode/ to compose cleanly.
 
 PyYAML is a core dep (always importable). A ``${{ }}`` expression inside a YAML
 flow-mapping breaks ``safe_load``, so the workflows MUST stay block style — if
@@ -20,19 +38,24 @@ from pathlib import Path
 import pytest
 import yaml
 
-# Test file lives at module_replay/tests/, so parents[2] is the repo root where
-# .github/workflows/ lives (mirrors test_paths_filter.py's parent.parent idiom,
-# one level higher to clear the module_replay/ package dir).
+# Test file lives at module_replay/tests/.
+# parents[0] = module_replay/tests/
+# parents[1] = module_replay/
+# parents[2] = repo root
+#
+# Path-A: templates live under module_replay/ci/10xcode/ (not .github/workflows/).
 REPO_ROOT = Path(__file__).resolve().parents[2]
-WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
-GATE = WORKFLOWS_DIR / "replay-gate.yml"
-NIGHTLY = WORKFLOWS_DIR / "replay-nightly.yml"
+WORKFLOWS_DIR = REPO_ROOT / "module_replay" / "ci" / "10xcode"
+GATE = WORKFLOWS_DIR / "replay-perception-gate.yml"
+NIGHTLY = WORKFLOWS_DIR / "replay-perception-nightly.yml"
+VIZ = WORKFLOWS_DIR / "replay-perception-viz.yml"
 
-# Skip-guard: .github IS present in this checkout, but a sparse/partial checkout
-# might omit it. Confirm the path resolves before asserting on its contents.
+# Skip-guard: confirm the templates are present before asserting on their content.
+# A sparse checkout that omits module_replay/ci/ would otherwise produce a confusing
+# FileNotFoundError rather than a clean skip.
 pytestmark = pytest.mark.skipif(
     not (GATE.is_file() and NIGHTLY.is_file()),
-    reason="workflow YAMLs not present in this checkout (.github absent)",
+    reason="perception CI templates not present in this checkout",
 )
 
 
@@ -118,22 +141,43 @@ def test_gate_uploads_logs():
 
 
 def test_nightly_uploads_artifacts():
-    """replay-nightly.yml uploads bag+report+logs (previously nothing), all ephemeral."""
+    """replay-nightly.yml uploads at least one ephemeral artifact (all ephemeral).
+
+    Path-A nightly shape: ONE ``nightly-<run_id>`` upload at /tmp/nightly that
+    bundles reports + logs + bag together in the single run directory.  There are
+    no separate ``report``/``logs``/``bag`` upload steps — those per-path
+    assertions are replaced by the three checks below.
+
+    (a) at least one upload-artifact step exists.
+    (b) every upload sets retention-days: 5.
+    (c) every uploaded path or artifact name contains "nightly" — confirming the
+        run-dir bundle pattern rather than a separate per-type upload.
+    """
     wf = _load(NIGHTLY)
     uploads = _upload_steps(wf)
-    assert len(uploads) >= 1, "replay-nightly.yml must upload at least one artifact now"
+    assert len(uploads) >= 1, "replay-nightly.yml must upload at least one artifact"
 
+    # (b) every upload is ephemeral
     for s in uploads:
-        assert (s.get("with") or {}).get("retention-days") == 5
+        with_block = s.get("with") or {}
+        assert (
+            with_block.get("retention-days") == 5
+        ), (
+            f"nightly upload step {s.get('name') or s.get('uses')!r} "
+            "must set retention-days: 5"
+        )
 
-    paths = [((s.get("with") or {}).get("path") or "") for s in uploads]
-    joined = "\n".join(paths)
-    assert any("report" in p for p in paths), "nightly must upload the report"
-    assert any("logs" in p for p in paths), "nightly must upload the logs"
-    # The bag is the third debuggable artifact.
-    assert "replay_output" in joined or any(
-        "bag" in ((s.get("with") or {}).get("name") or "") for s in uploads
-    ), "nightly must upload the output bag"
+    # (c) Path-A bundles all artefacts into the nightly-<run_id> directory;
+    #     the artifact name or path must contain "nightly".
+    for s in uploads:
+        with_block = s.get("with") or {}
+        artifact_name = (with_block.get("name") or "").lower()
+        artifact_path = (with_block.get("path") or "").lower()
+        assert "nightly" in artifact_name or "nightly" in artifact_path, (
+            f"nightly upload step {s.get('name') or s.get('uses')!r}: "
+            "expected artifact name or path to contain 'nightly' "
+            "(Path-A bundles all run artefacts into nightly-<run_id>/)"
+        )
 
 
 # --- NEW behavior: developer-facing artifact link -------------------------

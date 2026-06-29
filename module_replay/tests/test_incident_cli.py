@@ -410,3 +410,309 @@ def test_incident_cmd_replay_failure_exits_3(
         )
 
     assert result.exit_code == 3
+
+
+# ---------------------------------------------------------------------------
+# New tests for Task 3 (01.1-04): incident_spec threading + other_conditions
+# auto-assembly (FR-6(b))
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def configs_dir_with_detectors(tmp_path: Path) -> Path:
+    """configs_dir with a perception.yaml that has two incident_detectors entries."""
+    d = tmp_path / "configs" / "modules"
+    d.mkdir(parents=True)
+    (d / "perception.yaml").write_text(
+        """
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics: [/cam0/image_raw]
+output_topics: [/cam0/image_raw_sim]
+launch:
+  command: "ros2 launch realtime_perception perception.launch.py use_replay:=true"
+incident_detectors:
+  all_black_frame:
+    verifier_type: metric_condition
+    title: All-black frame collapse
+    provisional: true
+    condition:
+      metric: segmentation_coverage
+      field: segmentation_coverage
+      op: lt
+      threshold: 0.05
+  latency_spike:
+    verifier_type: metric_condition
+    title: Latency spike
+    provisional: true
+    condition:
+      metric: latency_p95_ms
+      field: latency_p95_ms
+      op: gt
+      threshold: 200.0
+"""
+    )
+    return tmp_path / "configs"
+
+
+def test_incident_key_threads_incident_spec_into_pipeline(
+    tmp_path: Path, configs_dir_with_detectors: Path
+):
+    """--incident-key threads the matching incident_detectors entry into
+    _run_metrics_pipeline as incident_spec; captured incident_spec matches
+    the registered entry (but without other_conditions for this assertion)."""
+    incident_bag = _make_incident_bag_dir(tmp_path)
+    output_dir = tmp_path / "output"
+    captured = {}
+
+    def fake_run_replay(module, data, output_dir):
+        result = MagicMock()
+        result.exit_code = 0
+        result.output_bag_path = output_dir / "bag"
+        result.logs_dir = None
+        return result
+
+    def fake_pipeline(module_spec, bag_path, output_dir, **kwargs):
+        captured["incident_spec"] = kwargs.get("incident_spec")
+        return 0
+
+    from replay.cli import main
+    runner = CliRunner()
+    with patch("replay.cli.run_replay", side_effect=fake_run_replay), \
+         patch("replay.cli._run_metrics_pipeline", side_effect=fake_pipeline):
+        result = runner.invoke(
+            main,
+            [
+                "incident",
+                "--module", "perception",
+                "--incident-bag", str(incident_bag),
+                "--incident-key", "all_black_frame",
+                "--output", str(output_dir),
+                "--configs-dir", str(configs_dir_with_detectors),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("incident_spec") is not None
+    spec = captured["incident_spec"]
+    # The selected condition is from all_black_frame
+    assert spec["condition"]["metric"] == "segmentation_coverage"
+    assert spec["condition"]["op"] == "lt"
+    assert spec["condition"]["threshold"] == 0.05
+
+
+def test_incident_key_auto_assembles_other_conditions(
+    tmp_path: Path, configs_dir_with_detectors: Path
+):
+    """other_conditions is auto-assembled from the OTHER registered detectors —
+    selecting 'all_black_frame' yields 'latency_spike' in other_conditions (FR-6(b))."""
+    incident_bag = _make_incident_bag_dir(tmp_path)
+    output_dir = tmp_path / "output"
+    captured = {}
+
+    def fake_run_replay(module, data, output_dir):
+        result = MagicMock()
+        result.exit_code = 0
+        result.output_bag_path = output_dir / "bag"
+        result.logs_dir = None
+        return result
+
+    def fake_pipeline(module_spec, bag_path, output_dir, **kwargs):
+        captured["incident_spec"] = kwargs.get("incident_spec")
+        return 0
+
+    from replay.cli import main
+    runner = CliRunner()
+    with patch("replay.cli.run_replay", side_effect=fake_run_replay), \
+         patch("replay.cli._run_metrics_pipeline", side_effect=fake_pipeline):
+        result = runner.invoke(
+            main,
+            [
+                "incident",
+                "--module", "perception",
+                "--incident-bag", str(incident_bag),
+                "--incident-key", "all_black_frame",
+                "--output", str(output_dir),
+                "--configs-dir", str(configs_dir_with_detectors),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    spec = captured["incident_spec"]
+    # other_conditions contains exactly the OTHER detector (latency_spike), not all_black_frame
+    others = spec.get("other_conditions", [])
+    assert len(others) == 1
+    other = others[0]
+    other_cond = other.get("condition", {})
+    assert other_cond.get("metric") == "latency_p95_ms"
+    # The selected key (all_black_frame) must NOT appear in other_conditions
+    for o in others:
+        assert o.get("condition", {}).get("metric") != "segmentation_coverage"
+
+
+def test_incident_key_not_found_runs_without_incident_spec(
+    tmp_path: Path, configs_dir_with_detectors: Path
+):
+    """An unknown --incident-key runs with incident_spec=None (plain golden verdict)."""
+    incident_bag = _make_incident_bag_dir(tmp_path)
+    output_dir = tmp_path / "output"
+    captured = {"incident_spec": "sentinel"}  # will be overwritten
+
+    def fake_run_replay(module, data, output_dir):
+        result = MagicMock()
+        result.exit_code = 0
+        result.output_bag_path = output_dir / "bag"
+        result.logs_dir = None
+        return result
+
+    def fake_pipeline(module_spec, bag_path, output_dir, **kwargs):
+        captured["incident_spec"] = kwargs.get("incident_spec")
+        return 0
+
+    from replay.cli import main
+    runner = CliRunner()
+    with patch("replay.cli.run_replay", side_effect=fake_run_replay), \
+         patch("replay.cli._run_metrics_pipeline", side_effect=fake_pipeline):
+        result = runner.invoke(
+            main,
+            [
+                "incident",
+                "--module", "perception",
+                "--incident-bag", str(incident_bag),
+                "--incident-key", "nonexistent_key",
+                "--output", str(output_dir),
+                "--configs-dir", str(configs_dir_with_detectors),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["incident_spec"] is None
+
+
+def test_no_incident_key_runs_without_incident_spec(
+    tmp_path: Path, configs_dir_with_detectors: Path
+):
+    """No --incident-key: incident_spec=None (backward-compatible golden-style run)."""
+    incident_bag = _make_incident_bag_dir(tmp_path)
+    output_dir = tmp_path / "output"
+    captured = {}
+
+    def fake_run_replay(module, data, output_dir):
+        result = MagicMock()
+        result.exit_code = 0
+        result.output_bag_path = output_dir / "bag"
+        result.logs_dir = None
+        return result
+
+    def fake_pipeline(module_spec, bag_path, output_dir, **kwargs):
+        captured["incident_spec"] = kwargs.get("incident_spec")
+        return 0
+
+    from replay.cli import main
+    runner = CliRunner()
+    with patch("replay.cli.run_replay", side_effect=fake_run_replay), \
+         patch("replay.cli._run_metrics_pipeline", side_effect=fake_pipeline):
+        result = runner.invoke(
+            main,
+            [
+                "incident",
+                "--module", "perception",
+                "--incident-bag", str(incident_bag),
+                "--output", str(output_dir),
+                "--configs-dir", str(configs_dir_with_detectors),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("incident_spec") is None
+
+
+def test_incident_help_shows_incident_key_flag():
+    """The `incident` subcommand help text includes --incident-key."""
+    from replay.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["incident", "--help"])
+    assert result.exit_code == 0
+    assert "--incident-key" in result.output
+
+
+def test_new_signature_verdict_fires_end_to_end(tmp_path: Path):
+    """End-to-end: with incident-key selecting 'all_black_frame' (condition NOT breaching),
+    but 'latency_spike' other_condition DOES breach, generate_report produces
+    incident_verdict['verdict'] == 'new_signature' (FR-6(b)).
+
+    Drives this by feeding hand-built metric values into generate_report via the
+    assembled incident_spec (no live replay), patching _run_metrics_pipeline to call
+    generate_report directly."""
+    import json
+    from replay.metrics.base import MetricResult
+    from replay.module_config import ThresholdSpec
+    from replay.metrics.report.generator import generate_report
+
+    # Build the incident_spec as the CLI would assemble it
+    incident_spec = {
+        "verifier_type": "metric_condition",
+        "condition": {
+            "metric": "segmentation_coverage",
+            "field": "segmentation_coverage",
+            "op": "lt",
+            "threshold": 0.05,
+        },
+        # The CLI assembles other_conditions from the OTHER detector
+        "other_conditions": [
+            {
+                "verifier_type": "metric_condition",
+                "condition": {
+                    "metric": "latency_p95_ms",
+                    "field": "latency_p95_ms",
+                    "op": "gt",
+                    "threshold": 200.0,
+                },
+            }
+        ],
+    }
+
+    # Metric results: coverage=0.3 (own condition NOT breaching), latency=350 (breaches)
+    seg_result = MetricResult(
+        name="segmentation_coverage", module="perception",
+        value={"segmentation_coverage": 0.3, "temporal_consistency_mean": 0.9,
+               "mean_class_coverage": 0.5},
+        passed=True, is_regression=False,
+    )
+    lat_result = MetricResult(
+        name="latency_p95_ms", module="perception",
+        value={"latency_p95_ms": 350.0},
+        passed=True, is_regression=False,
+    )
+
+    th = {
+        "replay_max_gap_ms": ThresholdSpec(max=200.0, tier="validity"),
+        "segmentation_coverage": ThresholdSpec(min=0.05, tier="quality"),
+    }
+    output_dir = tmp_path / "report"
+
+    rc = generate_report(
+        "perception", "t-e2e", [seg_result, lat_result], output_dir, th,
+        faithfulness={"max_gap_ms": 50.0, "drop_rate": 0.001, "breach_count": 0},
+        incident_spec=incident_spec,
+    )
+
+    doc = json.loads((output_dir / "metrics.json").read_text())
+    assert rc == 0   # golden gate unaffected (latency not in quality thresholds)
+    assert doc["pass"] is True
+    assert doc["incident_verdict"]["verdict"] == "new_signature"
+
+
+def test_graceful_degrade_pops_incident_spec():
+    """The try/except TypeError graceful-degrade block in _run_metrics_pipeline
+    contains report_kwargs.pop("incident_spec", None) — confirmed by source inspection.
+    This is the same pattern as run_artifacts/visualizations pops."""
+    import inspect
+    from replay.cli import _run_metrics_pipeline
+
+    source = inspect.getsource(_run_metrics_pipeline)
+    assert 'report_kwargs.pop("incident_spec"' in source, (
+        "graceful-degrade except block must pop 'incident_spec' from report_kwargs "
+        "(mirrors run_artifacts/visualizations pattern)"
+    )

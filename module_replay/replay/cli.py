@@ -77,6 +77,7 @@ def _run_metrics_pipeline(
     configs_dir: Path = DEFAULT_CONFIGS_DIR,
     run_artifacts: Optional[dict] = None,
     run_viz: bool = False,
+    incident_spec: Optional[dict] = None,
 ) -> int:
     """Run the registered perception plugins + faithfulness over an output bag,
     generate the report, and return the B9 exit code.
@@ -184,14 +185,20 @@ def _run_metrics_pipeline(
         # generate_report's plot rendering; without it the report has no plots.
         reader=reader,
     )
+    # Thread the incident_spec keyword if provided (01.1-04, Task 3).
+    # Only added when non-None so the existing golden-path runs are unaffected.
+    if incident_spec is not None:
+        report_kwargs["incident_spec"] = incident_spec
     try:
         rc = generate_report(**report_kwargs)
     except TypeError:
         # Graceful degrade: an older generate_report that predates the additive
-        # run_artifacts / visualizations params. Drop them and render without the
-        # Debug pointer map / viz links rather than crash the run.
+        # run_artifacts / visualizations / incident_spec params. Drop them and
+        # render without the Debug pointer map / viz links / incident verdict rather
+        # than crash the run.
         report_kwargs.pop("run_artifacts", None)
         report_kwargs.pop("visualizations", None)
+        report_kwargs.pop("incident_spec", None)
         rc = generate_report(**report_kwargs)
     click.echo(f"Metrics report: {reports_dir / 'report.html'}")
     click.echo(f"Verdict: {_VERDICT_LABELS[rc]}")
@@ -504,6 +511,13 @@ def metrics_cmd(
     default=None,
     help="Local rosbag2 incident-bag dir (must contain metadata.yaml). The cheap local-fixture path.",
 )
+@click.option(
+    "--incident-key",
+    default=None,
+    help="Key into module_spec.incident_detectors naming which seed condition to verify. "
+    "Required to produce an incident_verdict; falls back to plain golden-style verdict when omitted "
+    "or when the key is not found in the module's registered incident_detectors.",
+)
 @click.option("--version-yaml", type=click.Path(path_type=Path, exists=True), default=None)
 @click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
 @click.option("--configs-dir", type=click.Path(path_type=Path, exists=True), default=DEFAULT_CONFIGS_DIR)
@@ -519,6 +533,7 @@ def incident_cmd(
     module: str,
     incident_id: Optional[str],
     incident_bag: Optional[Path],
+    incident_key: Optional[str],
     version_yaml: Optional[Path],
     output_dir: Path,
     configs_dir: Path,
@@ -574,7 +589,41 @@ def incident_cmd(
             click.echo(f"Replay logs: {result.logs_dir}", err=True)
         sys.exit(3)
 
-    # 4. Metrics pipeline (B9 contract; plan 04 makes this incident-aware additively).
+    # 4. Resolve the incident_spec (01.1-04, Task 3 — the metric-condition seam).
+    #
+    # When --incident-key is given (or --incident-id resolves a known key), look up
+    # the matching entry from module_spec.incident_detectors and assemble the
+    # FR-6(b) "no new signature" reference set automatically from the OTHER registered
+    # detectors — module-generic; perception.yaml needs NO manual cross-listing (FR-12).
+    #
+    # selected_key: prefer --incident-key; fall back to --incident-id as a detector
+    # key lookup (an --incident-id that matches a detector key by name gets the spec
+    # for free); fall back to None (plain golden-style verdict, incident_spec=None).
+    selected_key = incident_key or incident_id
+    assembled_incident_spec = None
+    if selected_key and selected_key in module_spec.incident_detectors:
+        # Make a copy so we don't mutate the module_spec's frozen dict value.
+        assembled_incident_spec = dict(module_spec.incident_detectors[selected_key])
+        # Auto-assemble the new-signature reference set: every OTHER registered
+        # detector (by dict key) whose condition would newly breach = a new failure.
+        # This is FR-6(b) module-generic: a newly-added detector auto-joins every
+        # other incident's new-signature check with no manual cross-listing.
+        assembled_incident_spec["other_conditions"] = [
+            spec
+            for k, spec in module_spec.incident_detectors.items()
+            if k != selected_key
+        ]
+    elif selected_key:
+        # Key provided but not found in the registered detectors — fall back to plain
+        # golden-style verdict (incident_spec=None) and surface a notice.
+        click.echo(
+            f"Notice: incident key '{selected_key}' not found in "
+            f"module_spec.incident_detectors for '{module}' — "
+            "running without incident verdict (plain golden-style report).",
+            err=True,
+        )
+
+    # 5. Metrics pipeline (B9 contract; plan 04 makes this incident-aware additively).
     run_artifacts = {
         "bag": str(result.output_bag_path),
         "logs": str(result.logs_dir) if result.logs_dir is not None
@@ -588,6 +637,7 @@ def incident_cmd(
         baseline=baseline,
         configs_dir=configs_dir,
         run_artifacts=run_artifacts,
+        incident_spec=assembled_incident_spec,
     )
     if rc != 0:
         sys.exit(rc)

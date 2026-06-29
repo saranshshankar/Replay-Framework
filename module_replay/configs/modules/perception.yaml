@@ -129,6 +129,43 @@ thresholds:
       min: 0.98
       provisional: true
 
+# PROVISIONAL seed conditions — thresholds pending RQ-9 calibration + Aniket sign-off
+# (external dependency; does NOT block the verifier seam).
+# Each entry is a {metric, field, op, threshold} evaluated by incident_verifier.evaluate_condition
+# (plan 01.1-04). A breach (reproduced) is when op(value, threshold) is TRUE.
+incident_detectors:
+  # all-background segmentation collapse: the segmenter outputs ~no foreground.
+  seg_all_background:
+    verifier_type: metric_condition
+    title: "Segmentation collapsed to all-background"
+    provisional: true
+    condition: { metric: segmentation_coverage, field: segmentation_coverage, op: lt, threshold: 0.05 }
+  # depth-all-zero: the depth plane is invalid/empty.
+  depth_all_zero:
+    verifier_type: metric_condition
+    title: "Depth output all-zero / invalid"
+    provisional: true
+    condition: { metric: depth_validity, field: depth_validity, op: lt, threshold: 0.05 }
+  # FPS collapse: the pipeline throughput falls below a floor.
+  fps_collapse:
+    verifier_type: metric_condition
+    title: "Pipeline FPS collapse"
+    provisional: true
+    condition: { metric: pipeline_throughput_hz, field: pipeline_throughput_hz, op: lt, threshold: 3.0 }
+  # latency collapse: p95 inference latency blows past the budget.
+  latency_collapse:
+    verifier_type: metric_condition
+    title: "Inference latency collapse"
+    provisional: true
+    condition: { metric: latency_p95_ms, field: latency_p95_ms, op: gt, threshold: 100.0 }
+  # camera TimeSync collapse: cross-camera temporal consistency falls apart (proxy
+  # for the all-or-nothing camera time-sync failure mode — CLAUDE.md note).
+  timesync_collapse:
+    verifier_type: metric_condition
+    title: "Camera TimeSync collapse"
+    provisional: true
+    condition: { metric: segmentation_coverage, field: temporal_consistency_mean, op: lt, threshold: 0.2 }
+
 mocks: []
 
 preflight_assets:

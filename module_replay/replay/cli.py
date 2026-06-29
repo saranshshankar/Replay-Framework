@@ -7,7 +7,7 @@ from typing import Optional
 
 import click
 
-from replay.data_manager import resolve_local_bag, resolve_s3_bag
+from replay.data_manager import resolve_incident_bag, resolve_local_bag, resolve_s3_bag
 from replay.env_setup import DEFAULT_BUILD_JOBS, setup_environment
 from replay.module_config import (
     load_checkout_paths,
@@ -489,6 +489,108 @@ def metrics_cmd(
     )
     if rc != 0:
         sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
+
+
+@main.command("incident")
+@click.option("--module", required=True, type=click.Choice(["perception", "navigation", "manipulation"]))
+@click.option(
+    "--incident-id",
+    default=None,
+    help="Incident id to resolve from the incident-bag S3 bucket (incidents/<module>/<incident_id>/).",
+)
+@click.option(
+    "--incident-bag",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Local rosbag2 incident-bag dir (must contain metadata.yaml). The cheap local-fixture path.",
+)
+@click.option("--version-yaml", type=click.Path(path_type=Path, exists=True), default=None)
+@click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
+@click.option("--configs-dir", type=click.Path(path_type=Path, exists=True), default=DEFAULT_CONFIGS_DIR)
+@click.option("--s3-bucket", envvar="INCIDENT_BAG_BUCKET")
+@click.option(
+    "--baseline",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Pinned-golden baseline for regression metrics. A local rosbag2 path is used directly; "
+    "any other value resolves the golden via BaselineManager.",
+)
+def incident_cmd(
+    module: str,
+    incident_id: Optional[str],
+    incident_bag: Optional[Path],
+    version_yaml: Optional[Path],
+    output_dir: Path,
+    configs_dir: Path,
+    s3_bucket: Optional[str],
+    baseline: Optional[Path],
+) -> None:
+    """Replay an incident bag (local fixture or S3 canonical layout) and run the verdict pipeline.
+
+    Two resolution paths (LLD B4 / HLD A5):
+    - ``--incident-bag <dir>``  local rosbag2 dir (metadata.yaml required); the cheap
+      local-fixture path — no S3, no credentials.
+    - ``--incident-id <id> --s3-bucket <name>``  resolves via the canonical
+      ``incidents/<module>/<incident_id>/`` S3 layout and downloads the bag.
+
+    After resolving to a DataRef, runs the existing replay engine (``run_replay``)
+    and the metrics pipeline (``_run_metrics_pipeline``), exiting per the B9 verdict.
+    ``module`` is threaded as the existing click.Choice param — never hardcoded.
+    """
+    # 1. Load module spec — module threaded verbatim (NO hardcode).
+    module_spec = load_module_config(module, configs_dir / "modules")
+
+    # 2. Resolve the incident bag to a DataRef (mirror all_cmd:372-382).
+    if incident_bag is not None:
+        data_ref = resolve_local_bag(incident_bag)
+    elif incident_id:
+        if not s3_bucket:
+            raise click.UsageError(
+                "--s3-bucket (or INCIDENT_BAG_BUCKET env var) required to resolve "
+                "--incident-id from S3"
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        data_ref = resolve_incident_bag(
+            incident_id=incident_id,
+            module=module,   # module threaded into the canonical-layout resolver (NO hardcode)
+            bucket=s3_bucket,
+            dest_dir=output_dir,
+        )
+    else:
+        raise click.UsageError("Provide --incident-bag OR --incident-id")
+
+    # 3. Replay — mirrors run_cmd:318-322 + all_cmd:410-424 exit-3 branch.
+    result = run_replay(module=module_spec, data=data_ref, output_dir=output_dir)
+    click.echo(f"Output bag: {result.output_bag_path}")
+    if result.logs_dir is not None:
+        click.echo(f"Logs: {result.logs_dir}")
+    if result.exit_code != 0:
+        click.echo(
+            f"Replay failed (container exit code {result.exit_code}) "
+            "— exiting 3 (setup/replay error)",
+            err=True,
+        )
+        if result.logs_dir is not None:
+            click.echo(f"Replay logs: {result.logs_dir}", err=True)
+        sys.exit(3)
+
+    # 4. Metrics pipeline (B9 contract; plan 04 makes this incident-aware additively).
+    run_artifacts = {
+        "bag": str(result.output_bag_path),
+        "logs": str(result.logs_dir) if result.logs_dir is not None
+        else str(output_dir / "logs"),
+        "report": "report.html",
+    }
+    rc = _run_metrics_pipeline(
+        module_spec,
+        result.output_bag_path,
+        output_dir,
+        baseline=baseline,
+        configs_dir=configs_dir,
+        run_artifacts=run_artifacts,
+    )
+    if rc != 0:
+        sys.exit(rc)
 
 
 def _run_viz_pipeline(module_spec, bag_path: Path, output_dir: Path) -> list:

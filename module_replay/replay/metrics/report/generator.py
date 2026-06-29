@@ -144,6 +144,7 @@ def generate_report(
     run_artifacts: Optional[dict] = None,
     reader=None,
     visualizations: Optional[list] = None,
+    incident_spec: Optional[dict] = None,
 ) -> int:
     """Evaluate metrics vs thresholds, AND-gate quality, write artifacts, return the B9 exit code.
 
@@ -279,6 +280,50 @@ def generate_report(
     else:
         details = "all configured criteria passed"
 
+    # ── Additive incident verdict (01.1-04 / FR-6) ────────────────────────
+    # Computed BESIDE the existing verdict (above); incident_spec=None is the
+    # golden-path no-op. doc["pass"], doc["verdict"], and the B9 exit code are
+    # byte-for-byte unchanged — the incident outcome rides ONLY this new additive
+    # key (T-0104-03: overloading doc["pass"] is a landmine — gate.yml:144 reads it).
+    incident_verdict = None
+    if incident_spec is not None:
+        from replay.metrics.incident_verifier import evaluate_incident
+
+        result = evaluate_incident(incident_spec, metric_results)
+        # FR-6(b): any OTHER registered condition that newly breaches == a new signature.
+        # other_conditions is auto-assembled by the CLI (task 3) from the registered
+        # detectors; an absent/empty list is a no-op (plain golden run).
+        new_signature = False
+        for other in (incident_spec.get("other_conditions") or []):
+            other_result = evaluate_incident(other, metric_results)
+            if other_result.get("reproduced") is True:
+                new_signature = True
+                break
+
+        if not validity_pass:
+            # T-0104-02: never-fixed-on-INVALID — reuse the existing validity short-circuit.
+            # A forced-INVALID run can never be "fixed"; it is inconclusive (infra noise).
+            iv = "inconclusive"
+        elif result.get("uncomputable"):
+            iv = "inconclusive"
+        elif result.get("reproduced"):
+            iv = "reproduced"
+        elif new_signature:
+            iv = "new_signature"   # FR-6(b): a DIFFERENT registered condition newly breached
+        elif not quality_pass:
+            iv = "regressed"       # FR-6(c): the existing quality tier failed
+        else:
+            iv = "fixed"           # VALID + no-repro + no-new-signature + no-quality-regression
+
+        incident_verdict = {
+            "incident_id": incident_spec.get("incident_id"),
+            "verdict": iv,
+            "reproduced": result.get("reproduced"),
+            "condition": result.get("condition"),
+            "verifier_type": incident_spec.get("verifier_type", "metric_condition"),
+            "error_code": incident_spec.get("error_code"),   # optional label, never gates
+        }
+
     # ── Additive presentation layer (A1/A3) ────────────────────────────────
     # These keys are NEW and never rename/remove a contract key. The CI gate
     # reads doc["pass"]/doc["verdict"]/the rows; it ignores everything below.
@@ -297,7 +342,7 @@ def generate_report(
     doc = {
         "module": module,
         "run_id": run_id,
-        "pass": overall,
+        "pass": overall,                      # DO NOT TOUCH — gate.yml:144 reads this key
         "replay_faithfulness": faith_block,
         "metrics": rows,
         "verdict": verdict,
@@ -309,6 +354,9 @@ def generate_report(
         # Tier-3 viz (additive, never gated): report-relative mp4 links when the
         # --run-viz / viz path produced them, else None -> the template shows a hint.
         "visualizations": visualizations,
+        # Additive incident verdict (01.1-04 / FR-6): None when incident_spec is
+        # absent (golden path). NEVER overloads doc["pass"] — T-0104-03.
+        "incident_verdict": incident_verdict,
     }
     # metrics.json is the machine-read gate signal (CI reads doc["pass"] / verdict).
     # json.dumps cannot be HTML-injected, so the values pass through untransformed.

@@ -233,8 +233,12 @@ jobs:
           # Server-side SELECT: DB creds never reach fork code (guard above + internal-branch check).
           # Emits /tmp/incident_bags.tsv: incident_id<TAB>s3_bag_uri per line.
           python3 - <<'EOF'
-          import os, sys, subprocess, json
-          ids = os.environ['INCIDENT_IDS'].split()
+          import os, re, sys, subprocess, json
+          raw_ids = os.environ['INCIDENT_IDS'].split()
+          # Defense-in-depth (CR-01): only [A-Za-z0-9_-] IDs reach the SQL f-string
+          # below. parse_ticked_incident_ids enforces this at the source; this guards
+          # against any other producer of INCIDENT_IDS.
+          ids = [i for i in raw_ids if re.fullmatch(r'[A-Za-z0-9_-]+', i)]
           if not ids:
               print("No incident IDs — golden branch")
               sys.exit(0)
@@ -376,7 +380,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       INCIDENT_DB_URL: ${{ secrets.INCIDENT_DB_URL }}
-      INCIDENT_IDS: ${{ needs.detect.outputs.incident_ids }}
     steps:
       - name: Checkout the framework (for metrics.json schema + psql)
         uses: actions/checkout@v4
@@ -430,7 +433,7 @@ jobs:
 
               iv = doc.get('incident_verdict') or {}
               verdict  = iv.get('verdict', '')
-              iid      = iv.get('incident_id') or metrics_file.parts[-4]  # dir name fallback
+              iid      = iv.get('incident_id') or metrics_file.parts[-3]  # fallback: <out>/<iid>/reports/metrics.json
 
               if verdict in BLOCKED_VERDICTS:
                   print(f"SKIP mark {iid}: verdict={verdict!r} (not fixed)")

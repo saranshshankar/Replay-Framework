@@ -383,12 +383,12 @@ incident_detectors:
   INC-001:
     metric: latency_p95_ms
     field: latency_p95_ms
-    op: ">="
+    op: "ge"
     threshold: 50.0
   INC-002:
     metric: segmentation_coverage
     field: segmentation_coverage
-    op: "<="
+    op: "le"
     threshold: 0.3
 error_code_topic: /perception_node/error_code
 """
@@ -398,13 +398,13 @@ error_code_topic: /perception_node/error_code
         "INC-001": {
             "metric": "latency_p95_ms",
             "field": "latency_p95_ms",
-            "op": ">=",
+            "op": "ge",
             "threshold": 50.0,
         },
         "INC-002": {
             "metric": "segmentation_coverage",
             "field": "segmentation_coverage",
-            "op": "<=",
+            "op": "le",
             "threshold": 0.3,
         },
     }

@@ -182,7 +182,7 @@ jobs:
 
               iv      = doc.get('incident_verdict') or {}
               verdict = iv.get('verdict', '')
-              iid     = iv.get('incident_id') or metrics_file.parts[-4]
+              iid     = iv.get('incident_id') or metrics_file.parts[-3]  # <out>/<iid>/reports/metrics.json
 
               print(f"  {iid}: verdict={verdict!r}")
 

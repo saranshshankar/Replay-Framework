@@ -42,6 +42,14 @@ from typing import Optional
 
 CHECKLIST_MARKER = "<!-- module-replay-incident-checklist -->"
 
+# Incident IDs are restricted to this charset (recovery UUIDs and display IDs
+# like "INC-20260629-1430-unknown" both match). parse_ticked_incident_ids drops
+# any ticked token that does not FULLY match. The gate interpolates these IDs
+# into psql SQL, so this allowlist is the SQL-injection guard at the source
+# (CR-01) — a PR-comment line like "- [x] x'; DROP TABLE incidents; --" yields
+# nothing rather than an injectable token.
+_INCIDENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 
 def candidate_incidents(rows: list[dict]) -> list[dict]:
     """Return the de-duplicated, sorted open-incident candidates.
@@ -183,6 +191,11 @@ def parse_ticked_incident_ids(comment_body: str) -> list[str]:
     result: list[str] = []
     for match in pattern.finditer(comment_body):
         incident_id = match.group(1)
+        if not _INCIDENT_ID_RE.match(incident_id):
+            # Reject tokens carrying SQL/shell-significant characters. The gate
+            # interpolates incident_ids into psql; only [A-Za-z0-9_-] passes
+            # through (CR-01 — injection guard at the source).
+            continue
         if incident_id not in seen:
             seen.add(incident_id)
             result.append(incident_id)

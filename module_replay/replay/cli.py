@@ -191,11 +191,13 @@ def _run_metrics_pipeline(
         report_kwargs["incident_spec"] = incident_spec
     try:
         rc = generate_report(**report_kwargs)
-    except TypeError:
-        # Graceful degrade: an older generate_report that predates the additive
-        # run_artifacts / visualizations / incident_spec params. Drop them and
-        # render without the Debug pointer map / viz links / incident verdict rather
-        # than crash the run.
+    except TypeError as exc:
+        # Graceful degrade ONLY for an older generate_report that predates the
+        # additive run_artifacts / visualizations / incident_spec params (the
+        # "unexpected keyword argument" TypeError). Re-raise any other TypeError so
+        # genuine bugs inside generate_report are not silently swallowed (WR-01).
+        if "unexpected keyword argument" not in str(exc):
+            raise
         report_kwargs.pop("run_artifacts", None)
         report_kwargs.pop("visualizations", None)
         report_kwargs.pop("incident_spec", None)
@@ -604,6 +606,11 @@ def incident_cmd(
     if selected_key and selected_key in module_spec.incident_detectors:
         # Make a copy so we don't mutate the module_spec's frozen dict value.
         assembled_incident_spec = dict(module_spec.incident_detectors[selected_key])
+        # Carry the incident's real identity into the verdict so the gate's RDS-mark
+        # step keys off doc["incident_verdict"]["incident_id"] directly instead of
+        # parsing it from the output path (CR-02). Prefer the explicit --incident-id;
+        # fall back to the selected key (the gate passes the incident_id via --incident-key).
+        assembled_incident_spec["incident_id"] = incident_id or selected_key
         # Auto-assemble the new-signature reference set: every OTHER registered
         # detector (by dict key) whose condition would newly breach = a new failure.
         # This is FR-6(b) module-generic: a newly-added detector auto-joins every

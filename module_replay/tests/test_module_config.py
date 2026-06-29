@@ -350,3 +350,78 @@ def test_missing_preflight_assets_empty_when_no_block(tmp_path: Path):
         launch_command="x",
     )
     assert missing_preflight_assets(spec) == []
+
+
+# ---------------------------------------------------------------------------
+# 01.1-01: incident_detectors + error_code_topic (Task 1)
+# ---------------------------------------------------------------------------
+
+def test_incident_fields_default_when_absent(configs_dir: Path):
+    """01.1-01 D-14: load_module_config on a YAML with NO incident block yields
+    incident_detectors=={} and error_code_topic is None (existing caller unaffected)."""
+    spec = load_module_config("perception", configs_dir)
+    assert spec.incident_detectors == {}
+    assert spec.error_code_topic is None
+
+
+def test_incident_detectors_round_trips_verbatim(tmp_path: Path):
+    """01.1-01 D-13: an `incident_detectors:` mapping is returned VERBATIM (no
+    coercion) — the verifier in plan 04 owns interpretation, mirroring the
+    expected_hz/gap_tolerance precedent."""
+    d = tmp_path / "modules"
+    d.mkdir()
+    (d / "perception.yaml").write_text(
+        """
+name: perception
+container: planner
+colcon_package: realtime_perception
+input_topics: []
+output_topics: []
+launch:
+  command: "x"
+incident_detectors:
+  INC-001:
+    metric: latency_p95_ms
+    field: latency_p95_ms
+    op: ">="
+    threshold: 50.0
+  INC-002:
+    metric: segmentation_coverage
+    field: segmentation_coverage
+    op: "<="
+    threshold: 0.3
+error_code_topic: /perception_node/error_code
+"""
+    )
+    spec = load_module_config("perception", d)
+    assert spec.incident_detectors == {
+        "INC-001": {
+            "metric": "latency_p95_ms",
+            "field": "latency_p95_ms",
+            "op": ">=",
+            "threshold": 50.0,
+        },
+        "INC-002": {
+            "metric": "segmentation_coverage",
+            "field": "segmentation_coverage",
+            "op": "<=",
+            "threshold": 0.3,
+        },
+    }
+    assert spec.error_code_topic == "/perception_node/error_code"
+
+
+def test_six_field_modulespec_incident_fields_default():
+    """01.1-01 design-fidelity: the 6-field conftest fixture constructs ModuleSpec
+    with only the required fields; the new incident fields MUST be defaulted so
+    existing 6-field callers keep constructing without TypeError."""
+    spec = ModuleSpec(
+        name="perception",
+        container="planner",
+        colcon_package="realtime_perception",
+        input_topics=[],
+        output_topics=[],
+        launch_command="x",
+    )
+    assert spec.incident_detectors == {}
+    assert spec.error_code_topic is None

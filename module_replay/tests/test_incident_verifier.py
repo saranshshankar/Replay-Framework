@@ -306,12 +306,17 @@ def test_incident_verifier_is_offline_pure():
 # ---------------------------------------------------------------------------
 
 def test_incident_verifier_not_registered():
-    """incident_verifier must NOT use @register_metric — it is explicitly invoked,
-    following the replay_faithfulness.py precedent."""
+    """incident_verifier must NOT use @register_metric as a decorator — it is
+    explicitly invoked, following the replay_faithfulness.py precedent.
+
+    We check that no line starts with '@register_metric' (ignoring comments/docstrings
+    that merely mention the pattern for documentation purposes).
+    """
     import replay.metrics.incident_verifier as iv_mod
     source_file = iv_mod.__file__
-    text = open(source_file).read()
-    assert "@register_metric" not in text, (
-        "incident_verifier must not be a @register_metric plugin — "
-        "it is explicitly invoked (faithfulness precedent)"
+    lines = open(source_file).readlines()
+    decorator_lines = [l.strip() for l in lines if l.strip().startswith("@register_metric")]
+    assert decorator_lines == [], (
+        "incident_verifier must not use @register_metric as a decorator — "
+        "it is explicitly invoked (faithfulness precedent): found: " + str(decorator_lines)
     )

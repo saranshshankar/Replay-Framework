@@ -81,10 +81,24 @@ def test_ddl_no_zone_column():
 
 
 def test_ddl_required_columns_present():
-    """All five design-critical columns must appear in the DDL."""
+    """The design-critical plain-index columns must appear in the DDL (D-21: no condition)."""
     content = _DDL_PATH.read_text()
-    for col in ("verifier_type", "condition", "s3_bag_uri", "tenxcode_sha", "sentry_issue_url"):
+    for col in ("s3_bag_uri", "tenxcode_sha", "sentry_issue_url", "module_name", "status"):
         assert col in content, f"Expected column '{col}' in DDL"
+
+
+def test_ddl_carries_no_condition_columns():
+    """D-21: the RDS is a plain index — it must NOT DEFINE condition/verifier_type columns
+    (known-failure checks live in module config, not the RDS row). Matches a column
+    DEFINITION (line-anchored) so design comments mentioning the words are fine."""
+    import re
+    content = _DDL_PATH.read_text()
+    assert not re.search(r"(?m)^\s*condition\s+\w", content), (
+        "DDL must not define a 'condition' column (D-21 plain index)"
+    )
+    assert not re.search(r"(?m)^\s*verifier_type\s+\w", content), (
+        "DDL must not define a 'verifier_type' column (D-21 plain index)"
+    )
 
 
 def test_ddl_full_column_set():
@@ -100,8 +114,6 @@ def test_ddl_full_column_set():
         "area_code",
         "event_code",
         "title",
-        "condition",
-        "verifier_type",
         "s3_bag_uri",
         "trigger_source",
         "reason",

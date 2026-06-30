@@ -331,13 +331,13 @@ def test_sweep_reopens_reproduced_incidents():
 
 
 def test_sweep_keys_off_incident_verdict():
-    """The sweep reads doc['incident_verdict']['verdict'] to detect reproduction (B6)."""
+    """The sweep reads doc['incident_verdict']['verdict'] to detect reproduction (B6/D-21)."""
     raw = SWEEP.read_text()
     assert "incident_verdict" in raw, (
         "sweep must read the incident_verdict key from metrics.json (never a raw exit code)"
     )
-    assert "reproduced" in raw, (
-        "sweep must check for 'reproduced' verdict to trigger the reopen path"
+    assert "not_fixed" in raw, (
+        "sweep must trigger the reopen path on a 'not_fixed' verdict (D-21 config-as-checkset)"
     )
 
 

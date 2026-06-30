@@ -455,57 +455,11 @@ incident_detectors:
     return tmp_path / "configs"
 
 
-def test_incident_key_threads_incident_spec_into_pipeline(
+def test_incident_key_targeted_threads_single_check(
     tmp_path: Path, configs_dir_with_detectors: Path
 ):
-    """--incident-key threads the matching incident_detectors entry into
-    _run_metrics_pipeline as incident_spec; captured incident_spec matches
-    the registered entry (but without other_conditions for this assertion)."""
-    incident_bag = _make_incident_bag_dir(tmp_path)
-    output_dir = tmp_path / "output"
-    captured = {}
-
-    def fake_run_replay(module, data, output_dir):
-        result = MagicMock()
-        result.exit_code = 0
-        result.output_bag_path = output_dir / "bag"
-        result.logs_dir = None
-        return result
-
-    def fake_pipeline(module_spec, bag_path, output_dir, **kwargs):
-        captured["incident_spec"] = kwargs.get("incident_spec")
-        return 0
-
-    from replay.cli import main
-    runner = CliRunner()
-    with patch("replay.cli.run_replay", side_effect=fake_run_replay), \
-         patch("replay.cli._run_metrics_pipeline", side_effect=fake_pipeline):
-        result = runner.invoke(
-            main,
-            [
-                "incident",
-                "--module", "perception",
-                "--incident-bag", str(incident_bag),
-                "--incident-key", "all_black_frame",
-                "--output", str(output_dir),
-                "--configs-dir", str(configs_dir_with_detectors),
-            ],
-        )
-
-    assert result.exit_code == 0, result.output
-    assert captured.get("incident_spec") is not None
-    spec = captured["incident_spec"]
-    # The selected condition is from all_black_frame
-    assert spec["condition"]["metric"] == "segmentation_coverage"
-    assert spec["condition"]["op"] == "lt"
-    assert spec["condition"]["threshold"] == 0.05
-
-
-def test_incident_key_auto_assembles_other_conditions(
-    tmp_path: Path, configs_dir_with_detectors: Path
-):
-    """other_conditions is auto-assembled from the OTHER registered detectors —
-    selecting 'all_black_frame' yields 'latency_spike' in other_conditions (FR-6(b))."""
+    """LOCAL DEBUG (D-21): --incident-key threads a 'targeted' spec whose checks are
+    exactly that ONE detector; incident_id falls back to the key when --incident-id absent."""
     incident_bag = _make_incident_bag_dir(tmp_path)
     output_dir = tmp_path / "output"
     captured = {}
@@ -539,15 +493,55 @@ def test_incident_key_auto_assembles_other_conditions(
 
     assert result.exit_code == 0, result.output
     spec = captured["incident_spec"]
-    # other_conditions contains exactly the OTHER detector (latency_spike), not all_black_frame
-    others = spec.get("other_conditions", [])
-    assert len(others) == 1
-    other = others[0]
-    other_cond = other.get("condition", {})
-    assert other_cond.get("metric") == "latency_p95_ms"
-    # The selected key (all_black_frame) must NOT appear in other_conditions
-    for o in others:
-        assert o.get("condition", {}).get("metric") != "segmentation_coverage"
+    assert spec is not None
+    assert spec["mode"] == "targeted"
+    assert set(spec["checks"].keys()) == {"all_black_frame"}
+    assert spec["checks"]["all_black_frame"]["condition"]["metric"] == "segmentation_coverage"
+    assert spec["incident_id"] == "all_black_frame"
+
+
+def test_incident_id_no_key_verifies_all_detectors(
+    tmp_path: Path, configs_dir_with_detectors: Path
+):
+    """CI DEFAULT (D-21): --incident-id with no --incident-key threads an 'all' spec whose
+    checks are EVERY registered detector; the incident_id is stamped onto the spec."""
+    incident_bag = _make_incident_bag_dir(tmp_path)
+    output_dir = tmp_path / "output"
+    captured = {}
+
+    def fake_run_replay(module, data, output_dir):
+        result = MagicMock()
+        result.exit_code = 0
+        result.output_bag_path = output_dir / "bag"
+        result.logs_dir = None
+        return result
+
+    def fake_pipeline(module_spec, bag_path, output_dir, **kwargs):
+        captured["incident_spec"] = kwargs.get("incident_spec")
+        return 0
+
+    from replay.cli import main
+    runner = CliRunner()
+    with patch("replay.cli.run_replay", side_effect=fake_run_replay), \
+         patch("replay.cli._run_metrics_pipeline", side_effect=fake_pipeline):
+        result = runner.invoke(
+            main,
+            [
+                "incident",
+                "--module", "perception",
+                "--incident-bag", str(incident_bag),
+                "--incident-id", "INC-2026-001",
+                "--output", str(output_dir),
+                "--configs-dir", str(configs_dir_with_detectors),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    spec = captured["incident_spec"]
+    assert spec is not None
+    assert spec["mode"] == "all"
+    assert set(spec["checks"].keys()) == {"all_black_frame", "latency_spike"}
+    assert spec["incident_id"] == "INC-2026-001"
 
 
 def test_incident_key_not_found_runs_without_incident_spec(
@@ -637,43 +631,36 @@ def test_incident_help_shows_incident_key_flag():
     assert "--incident-key" in result.output
 
 
-def test_new_signature_verdict_fires_end_to_end(tmp_path: Path):
-    """End-to-end: with incident-key selecting 'all_black_frame' (condition NOT breaching),
-    but 'latency_spike' other_condition DOES breach, generate_report produces
-    incident_verdict['verdict'] == 'new_signature' (FR-6(b)).
-
-    Drives this by feeding hand-built metric values into generate_report via the
-    assembled incident_spec (no live replay), patching _run_metrics_pipeline to call
-    generate_report directly."""
+def test_other_detector_tripping_is_not_fixed_end_to_end(tmp_path: Path):
+    """End-to-end (D-21): the gate runs ALL detectors. The incident's 'own' signature
+    (all_black_frame) does NOT trip, but a DIFFERENT known failure (latency_spike) DOES —
+    so the verdict is 'not_fixed' (a known catastrophic failure is still present), with that
+    detector named in `tripped`. Drives generate_report with a hand-built check set."""
     import json
     from replay.metrics.base import MetricResult
     from replay.module_config import ThresholdSpec
     from replay.metrics.report.generator import generate_report
 
-    # Build the incident_spec as the CLI would assemble it
+    # incident_spec as the CLI assembles it in CI mode: ALL detectors in `checks`.
     incident_spec = {
+        "incident_id": "INC-E2E",
+        "mode": "all",
         "verifier_type": "metric_condition",
-        "condition": {
-            "metric": "segmentation_coverage",
-            "field": "segmentation_coverage",
-            "op": "lt",
-            "threshold": 0.05,
-        },
-        # The CLI assembles other_conditions from the OTHER detector
-        "other_conditions": [
-            {
+        "checks": {
+            "all_black_frame": {
                 "verifier_type": "metric_condition",
-                "condition": {
-                    "metric": "latency_p95_ms",
-                    "field": "latency_p95_ms",
-                    "op": "gt",
-                    "threshold": 200.0,
-                },
-            }
-        ],
+                "condition": {"metric": "segmentation_coverage", "field": "segmentation_coverage",
+                              "op": "lt", "threshold": 0.05},
+            },
+            "latency_spike": {
+                "verifier_type": "metric_condition",
+                "condition": {"metric": "latency_p95_ms", "field": "latency_p95_ms",
+                              "op": "gt", "threshold": 200.0},
+            },
+        },
     }
 
-    # Metric results: coverage=0.3 (own condition NOT breaching), latency=350 (breaches)
+    # coverage=0.3 (all_black_frame does NOT trip); latency=350 (latency_spike DOES trip)
     seg_result = MetricResult(
         name="segmentation_coverage", module="perception",
         value={"segmentation_coverage": 0.3, "temporal_consistency_mean": 0.9,
@@ -701,7 +688,9 @@ def test_new_signature_verdict_fires_end_to_end(tmp_path: Path):
     doc = json.loads((output_dir / "metrics.json").read_text())
     assert rc == 0   # golden gate unaffected (latency not in quality thresholds)
     assert doc["pass"] is True
-    assert doc["incident_verdict"]["verdict"] == "new_signature"
+    iv = doc["incident_verdict"]
+    assert iv["verdict"] == "not_fixed"
+    assert iv["tripped"] == ["latency_spike"]
 
 
 def test_graceful_degrade_pops_incident_spec():

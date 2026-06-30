@@ -153,14 +153,14 @@ jobs:
             replay-module incident \
               --module "$MODULE" \
               --incident-bag "$bag" \
-              --incident-key "$iid" \
+              --incident-id "$iid" \
               --output "$out" || true   # collect all, AND-gate in next step
             cd "$GITHUB_WORKSPACE"
           done < /tmp/sweep_bags.tsv
 
       # AND-gate: read doc["incident_verdict"]["verdict"] from each bag's metrics.json.
-      # A verdict of 'reproduced' or 'new_signature' triggers a RDS reopen (status='open')
-      # and fails the sweep job, blocking the cut (B6 / FR-10).
+      # A 'not_fixed' verdict (a known catastrophic failure reproduced) triggers a RDS
+      # reopen (status='open') and fails the sweep job, blocking the cut (B6 / FR-10 / D-21).
       - name: "Sweep: AND-gate verdicts + reopen reproduced incidents in RDS"
         id: and_gate
         env:
@@ -186,8 +186,8 @@ jobs:
 
               print(f"  {iid}: verdict={verdict!r}")
 
-              # Reproduction or new failure signature -> reopen + fail the cut (B6)
-              if verdict in ('reproduced', 'new_signature'):
+              # A known failure still present ('not_fixed') -> reopen + fail the cut (B6/D-21)
+              if verdict == 'not_fixed':
                   reproduced.append((iid, verdict))
                   if db_url:
                       sql = (

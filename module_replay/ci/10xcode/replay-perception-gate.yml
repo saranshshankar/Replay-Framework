@@ -288,13 +288,14 @@ jobs:
             bag="/tmp/incident_bags/${iid}"
             echo "=== Replaying incident $iid ==="
             cd replay-framework/module_replay
-            # --incident-bag: staged local path; --incident-key: the matched incident ID.
-            # The gate uses --incident-bag (RDS-authoritative URI + staged path) rather than
-            # --incident-id so the DB remains the single source of truth (B3 design clarity).
+            # --incident-bag: the RDS-authoritative staged bag (the DB stays the single source
+            # of truth for WHERE the bag is). --incident-id: stamps the verdict + triggers the
+            # verify-against-ALL-detectors mode (D-21 — the conditions come from config, not the
+            # RDS; the gate runs the whole detector set and "fixed" == no detector trips).
             replay-module incident \
               --module "$MODULE" \
               --incident-bag "$bag" \
-              --incident-key "$iid" \
+              --incident-id "$iid" \
               --output "$out" \
               --version-yaml /tmp/version.yaml || true   # collect all, AND-gate below
             cd "$GITHUB_WORKSPACE"
@@ -330,13 +331,13 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # metrics — cheap CPU; computes + gates on metrics.json (golden branch, doc['pass']).
-  # For the incident branch the AND-gate is in the mark job; this job still runs both
-  # paths (it processes the golden output bag for the golden branch; for incidents it
-  # downloads the per-incident reports and checks each incident_verdict).
+  # metrics — cheap CPU; GOLDEN BRANCH ONLY. Computes metrics.json and gates on
+  # doc['pass'] for the untagged-golden path. The incident branch's AND-gate lives
+  # in the `mark` job (which reads each incident_verdict), so metrics is skipped there.
   # ---------------------------------------------------------------------------
   metrics:
-    needs: replay
+    needs: [detect, replay]
+    if: needs.detect.outputs.incident_ids == ''
     runs-on: ubuntu-latest                         # cheap; no GPU, no ROS, no secrets
     steps:
       - name: Checkout the framework (metrics only)
@@ -366,16 +367,18 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # mark — incident path only; idempotent RDS UPDATE for each incident whose
-  # doc["incident_verdict"]["verdict"] == "fixed" (reads the VERDICT KEY — never a
-  # raw exit code; T-0106-04 / B6).  Runs after the GPU replay.
-  # NEVER marks fixed on inconclusive / reproduced / new_signature / regressed.
+  # mark — INCIDENT BRANCH ONLY; the incident AND-gate. Reads each per-incident
+  # doc["incident_verdict"]["verdict"] (the VERDICT KEY — never a raw exit code;
+  # T-0106-04 / B6), marks the "fixed" rows in the RDS, and FAILS the job (so the
+  # required check goes red) if ANY tagged incident is not "fixed" (D-21).
+  # NEVER marks fixed on not_fixed / inconclusive.
   # ---------------------------------------------------------------------------
   mark:
-    needs: replay
+    needs: [detect, replay]
     if: >
       always() &&
       needs.replay.result != 'skipped' &&
+      needs.detect.outputs.incident_ids != '' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     env:
@@ -412,18 +415,18 @@ jobs:
 
           db_url = os.environ.get('INCIDENT_DB_URL', '')
           if not db_url:
-              print("INCIDENT_DB_URL not set — skipping mark step.")
-              sys.exit(0)
+              # No DB configured (infra not yet provisioned): still VERIFY + AND-gate from
+              # metrics.json below; only the RDS UPDATE is skipped.
+              print("INCIDENT_DB_URL not set — verifying verdicts only (no RDS mark).")
 
           pr_number = os.environ.get('PR_NUMBER', '')
           pr_sha    = os.environ.get('PR_SHA', '')
           run_id    = os.environ.get('RUN_ID', '')
 
           FIXED_VERDICT = 'fixed'
-          # NEVER mark on these verdicts (T-0106-04):
-          BLOCKED_VERDICTS = {'inconclusive', 'reproduced', 'new_signature', 'regressed'}
 
           marked = []
+          not_fixed = []   # tagged incidents whose fix did NOT verify — these block the gate
           for metrics_file in sorted(incident_out.rglob('reports/metrics.json')):
               try:
                   doc = json.loads(metrics_file.read_text())
@@ -434,16 +437,23 @@ jobs:
               iv = doc.get('incident_verdict') or {}
               verdict  = iv.get('verdict', '')
               iid      = iv.get('incident_id') or metrics_file.parts[-3]  # fallback: <out>/<iid>/reports/metrics.json
+              tripped  = iv.get('tripped') or []
 
-              if verdict in BLOCKED_VERDICTS:
-                  print(f"SKIP mark {iid}: verdict={verdict!r} (not fixed)")
-                  continue
               if verdict != FIXED_VERDICT:
-                  print(f"SKIP mark {iid}: verdict={verdict!r} (not 'fixed')")
+                  # not_fixed (a known failure still present) or inconclusive (INVALID /
+                  # uncomputable) — NEVER mark fixed (T-0106-04); record to block the gate.
+                  print(f"NOT FIXED {iid}: verdict={verdict!r} tripped={tripped}")
+                  not_fixed.append(iid)
+                  continue
+
+              if not db_url:
+                  print(f"Would mark fixed (no DB): {iid}")
+                  marked.append(iid)
                   continue
 
               # Idempotent UPDATE: only rows that are still open get updated (B6 / FR-8).
-              # WHERE incident_id=$1 AND status<>'fixed' prevents double-writes.
+              # WHERE incident_id=$1 AND status<>'fixed' prevents double-writes. iid is
+              # allowlisted at the parse_ticked_incident_ids source (CR-01).
               sql = (
                   f"UPDATE module_replay_incidents "
                   f"SET status='fixed', fixed=true, "
@@ -464,6 +474,10 @@ jobs:
                   marked.append(iid)
 
           print(f"Total marked fixed: {len(marked)}")
+          # The incident AND-gate (D-21): any tagged incident not 'fixed' fails the check.
+          if not_fixed:
+              print(f"GATE FAIL: {len(not_fixed)} incident(s) not fixed: {not_fixed}")
+              sys.exit(1)
           EOF
 
   # ---------------------------------------------------------------------------
@@ -471,7 +485,7 @@ jobs:
   # One job under the gate context name so branch protection never changes.
   # ---------------------------------------------------------------------------
   gate:
-    needs: [replay, metrics, mark]
+    needs: [detect, replay, metrics, mark]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -486,10 +500,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           REPLAY="${{ needs.replay.result }}"
           METRICS="${{ needs.metrics.result }}"
-          # gate passes if replay+metrics both succeeded OR replay was legitimately skipped
-          # (detect said perception was untouched → the gate emits a neutral pass).
+          MARK="${{ needs.mark.result }}"
+          INCIDENTS="${{ needs.detect.outputs.incident_ids }}"
+          # Neutral pass when the perception path was untouched (detect → replay skipped).
           if [ "$REPLAY" = "skipped" ]; then
             echo "Perception path untouched — neutral pass."
             exit 0
           fi
-          [ "$REPLAY" = "success" ] && [ "$METRICS" = "success" ] || exit 1
+          [ "$REPLAY" = "success" ] || { echo "Replay failed."; exit 1; }
+          if [ -n "$INCIDENTS" ]; then
+            # Incident branch: the mark job IS the AND-gate (fails if any tagged incident
+            # is not 'fixed'). metrics is skipped on this branch (D-21).
+            [ "$MARK" = "success" ] || { echo "One or more tagged incidents are not fixed."; exit 1; }
+          else
+            # Golden branch: the metrics job gates on doc['pass'].
+            [ "$METRICS" = "success" ] || { echo "Golden quality gate failed."; exit 1; }
+          fi

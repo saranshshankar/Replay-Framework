@@ -505,7 +505,9 @@ def metrics_cmd(
 @click.option(
     "--incident-id",
     default=None,
-    help="Incident id to resolve from the incident-bag S3 bucket (incidents/<module>/<incident_id>/).",
+    help="Incident id. Picks the bag (S3 canonical layout incidents/<module>/<incident_id>/ "
+    "when --incident-bag is absent) and stamps the verdict. With no --incident-key it triggers "
+    "the CI default: verify against ALL the module's incident_detectors (fixed iff none trip).",
 )
 @click.option(
     "--incident-bag",
@@ -516,9 +518,9 @@ def metrics_cmd(
 @click.option(
     "--incident-key",
     default=None,
-    help="Key into module_spec.incident_detectors naming which seed condition to verify. "
-    "Required to produce an incident_verdict; falls back to plain golden-style verdict when omitted "
-    "or when the key is not found in the module's registered incident_detectors.",
+    help="LOCAL-DEBUG: verify against this ONE named entry of module_spec.incident_detectors "
+    "(targeted). CI omits this and passes --incident-id to verify against ALL detectors. "
+    "Falls back to a plain golden-style verdict when the key is not found.",
 )
 @click.option("--version-yaml", type=click.Path(path_type=Path, exists=True), default=None)
 @click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
@@ -591,44 +593,49 @@ def incident_cmd(
             click.echo(f"Replay logs: {result.logs_dir}", err=True)
         sys.exit(3)
 
-    # 4. Resolve the incident_spec (01.1-04, Task 3 — the metric-condition seam).
+    # 4. Assemble the incident check-set (01.1 — config-as-checkset, D-21).
     #
-    # When --incident-key is given (or --incident-id resolves a known key), look up
-    # the matching entry from module_spec.incident_detectors and assemble the
-    # FR-6(b) "no new signature" reference set automatically from the OTHER registered
-    # detectors — module-generic; perception.yaml needs NO manual cross-listing (FR-12).
-    #
-    # selected_key: prefer --incident-key; fall back to --incident-id as a detector
-    # key lookup (an --incident-id that matches a detector key by name gets the spec
-    # for free); fall back to None (plain golden-style verdict, incident_spec=None).
-    selected_key = incident_key or incident_id
+    # KNOWN-FAILURE conditions live in module config (incident_detectors, authored
+    # once per failure type by the module owner). The RDS is a plain index
+    # (incident_id + bag + status) and carries NO conditions. The gate replays the
+    # bag and runs the detector set; "fixed" == VALID AND no detector trips.
+    #   - CI default (--incident-id, no --incident-key): verify against ALL the
+    #     module's detectors. incident_id only picks the bag + stamps the verdict.
+    #   - local debug (--incident-key <k>): verify against that ONE detector.
+    # incident_spec=None → plain golden-style report (no incident verdict).
+    detectors = module_spec.incident_detectors
     assembled_incident_spec = None
-    if selected_key and selected_key in module_spec.incident_detectors:
-        # Make a copy so we don't mutate the module_spec's frozen dict value.
-        assembled_incident_spec = dict(module_spec.incident_detectors[selected_key])
-        # Carry the incident's real identity into the verdict so the gate's RDS-mark
-        # step keys off doc["incident_verdict"]["incident_id"] directly instead of
-        # parsing it from the output path (CR-02). Prefer the explicit --incident-id;
-        # fall back to the selected key (the gate passes the incident_id via --incident-key).
-        assembled_incident_spec["incident_id"] = incident_id or selected_key
-        # Auto-assemble the new-signature reference set: every OTHER registered
-        # detector (by dict key) whose condition would newly breach = a new failure.
-        # This is FR-6(b) module-generic: a newly-added detector auto-joins every
-        # other incident's new-signature check with no manual cross-listing.
-        assembled_incident_spec["other_conditions"] = [
-            spec
-            for k, spec in module_spec.incident_detectors.items()
-            if k != selected_key
-        ]
-    elif selected_key:
-        # Key provided but not found in the registered detectors — fall back to plain
-        # golden-style verdict (incident_spec=None) and surface a notice.
-        click.echo(
-            f"Notice: incident key '{selected_key}' not found in "
-            f"module_spec.incident_detectors for '{module}' — "
-            "running without incident verdict (plain golden-style report).",
-            err=True,
-        )
+    if incident_key:
+        if incident_key in detectors:
+            assembled_incident_spec = {
+                "incident_id": incident_id or incident_key,
+                "mode": "targeted",
+                "checks": {incident_key: dict(detectors[incident_key])},
+                "verifier_type": detectors[incident_key].get(
+                    "verifier_type", "metric_condition"
+                ),
+            }
+        else:
+            click.echo(
+                f"Notice: incident key '{incident_key}' not found in "
+                f"module_spec.incident_detectors for '{module}' — running without "
+                "incident verdict (plain golden-style report).",
+                err=True,
+            )
+    elif incident_id:
+        if detectors:
+            assembled_incident_spec = {
+                "incident_id": incident_id,
+                "mode": "all",
+                "checks": {k: dict(v) for k, v in detectors.items()},
+                "verifier_type": "metric_condition",
+            }
+        else:
+            click.echo(
+                f"Notice: no incident_detectors configured for '{module}' — running "
+                "without incident verdict (plain golden-style report).",
+                err=True,
+            )
 
     # 5. Metrics pipeline (B9 contract; plan 04 makes this incident-aware additively).
     run_artifacts = {

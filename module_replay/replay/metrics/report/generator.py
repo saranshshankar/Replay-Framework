@@ -280,48 +280,49 @@ def generate_report(
     else:
         details = "all configured criteria passed"
 
-    # ── Additive incident verdict (01.1-04 / FR-6) ────────────────────────
-    # Computed BESIDE the existing verdict (above); incident_spec=None is the
-    # golden-path no-op. doc["pass"], doc["verdict"], and the B9 exit code are
-    # byte-for-byte unchanged — the incident outcome rides ONLY this new additive
-    # key (T-0104-03: overloading doc["pass"] is a landmine — gate.yml:144 reads it).
+    # ── Additive incident verdict (01.1 — config-as-checkset, D-21) ───────────
+    # The incident gate replays a failure's bag and runs EVERY known-failure
+    # detector in incident_spec["checks"] (authored in module config, once per
+    # failure type). "fixed" == VALID AND no detector trips. Golden-quality
+    # thresholds are deliberately NOT required on a (degraded) incident bag —
+    # the bar is "the catastrophic signatures are gone", not full golden quality
+    # (the knob). doc["pass"], doc["verdict"], and the B9 exit code are byte-for-
+    # byte unchanged — the incident outcome rides ONLY this additive key
+    # (T-0104-03: overloading doc["pass"] is a landmine — the golden gate reads it).
+    # incident_spec=None is the golden-path no-op.
     incident_verdict = None
     if incident_spec is not None:
         from replay.metrics.incident_verifier import evaluate_incident
 
-        result = evaluate_incident(incident_spec, metric_results)
-        # FR-6(b): any OTHER registered condition that newly breaches == a new signature.
-        # other_conditions is auto-assembled by the CLI (task 3) from the registered
-        # detectors; an absent/empty list is a no-op (plain golden run).
-        new_signature = False
-        for other in (incident_spec.get("other_conditions") or []):
-            other_result = evaluate_incident(other, metric_results)
-            if other_result.get("reproduced") is True:
-                new_signature = True
-                break
+        checks = incident_spec.get("checks") or {}
+        tripped = []        # detectors whose known-failure condition still breaches
+        uncomputable = []   # detectors whose metric was not computed this run
+        for key, detector in checks.items():
+            # evaluate_incident dispatches on verifier_type; an error_code detector
+            # with a missing code returns reproduced=False (D-14 — never trips/blocks).
+            r = evaluate_incident(detector, metric_results)
+            if r.get("uncomputable"):
+                uncomputable.append(key)
+            elif r.get("reproduced") is True:
+                tripped.append(key)
 
         if not validity_pass:
-            # T-0104-02: never-fixed-on-INVALID — reuse the existing validity short-circuit.
-            # A forced-INVALID run can never be "fixed"; it is inconclusive (infra noise).
+            # never-fixed-on-INVALID: a flaky/degraded run can't confirm a fix.
             iv = "inconclusive"
-        elif result.get("uncomputable"):
-            iv = "inconclusive"
-        elif result.get("reproduced"):
-            iv = "reproduced"
-        elif new_signature:
-            iv = "new_signature"   # FR-6(b): a DIFFERENT registered condition newly breached
-        elif not quality_pass:
-            iv = "regressed"       # FR-6(c): the existing quality tier failed
+        elif tripped:
+            iv = "not_fixed"       # ≥1 known catastrophic failure still present
+        elif uncomputable:
+            iv = "inconclusive"    # couldn't verify every detector → don't claim fixed
         else:
-            iv = "fixed"           # VALID + no-repro + no-new-signature + no-quality-regression
+            iv = "fixed"           # VALID + no known failure present (quality NOT required — the knob)
 
         incident_verdict = {
             "incident_id": incident_spec.get("incident_id"),
             "verdict": iv,
-            "reproduced": result.get("reproduced"),
-            "condition": result.get("condition"),
+            "mode": incident_spec.get("mode", "all"),
+            "tripped": tripped,             # which known failures are still present (diagnostic)
+            "uncomputable": uncomputable,   # detectors whose metric was not computed
             "verifier_type": incident_spec.get("verifier_type", "metric_condition"),
-            "error_code": incident_spec.get("error_code"),   # optional label, never gates
         }
 
     # ── Additive presentation layer (A1/A3) ────────────────────────────────

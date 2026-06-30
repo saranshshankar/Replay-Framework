@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS module_replay_incidents (
     area_code        INTEGER,
     event_code       INTEGER,
     title            TEXT,
-    condition        TEXT,                         -- metric-condition expression (D-13)
-    verifier_type    TEXT,                         -- 'metric_condition' (perception) | 'error_code' (future)
+    -- D-21: the RDS is a PLAIN INDEX — known-failure checks live in module config
+    -- (incident_detectors), never in the row; the gate runs the config detector set.
     s3_bag_uri       TEXT,                         -- nullable until the uploader sets it (FR-5)
     trigger_source   TEXT,
     reason           TEXT,

@@ -7,7 +7,7 @@ from typing import Optional
 
 import click
 
-from replay.data_manager import resolve_incident_bag, resolve_local_bag, resolve_s3_bag
+from replay.data_manager import resolve_local_bag, resolve_s3_bag
 from replay.env_setup import DEFAULT_BUILD_JOBS, setup_environment
 from replay.module_config import (
     load_checkout_paths,
@@ -525,7 +525,6 @@ def metrics_cmd(
 @click.option("--version-yaml", type=click.Path(path_type=Path, exists=True), default=None)
 @click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
 @click.option("--configs-dir", type=click.Path(path_type=Path, exists=True), default=DEFAULT_CONFIGS_DIR)
-@click.option("--s3-bucket", envvar="INCIDENT_BAG_BUCKET")
 @click.option(
     "--baseline",
     type=click.Path(path_type=Path),
@@ -541,42 +540,33 @@ def incident_cmd(
     version_yaml: Optional[Path],
     output_dir: Path,
     configs_dir: Path,
-    s3_bucket: Optional[str],
     baseline: Optional[Path],
 ) -> None:
-    """Replay an incident bag (local fixture or S3 canonical layout) and run the verdict pipeline.
+    """Replay an incident bag and run the verdict pipeline.
 
-    Two resolution paths (LLD B4 / HLD A5):
-    - ``--incident-bag <dir>``  local rosbag2 dir (metadata.yaml required); the cheap
-      local-fixture path — no S3, no credentials.
-    - ``--incident-id <id> --s3-bucket <name>``  resolves via the canonical
-      ``incidents/<module>/<incident_id>/`` S3 layout and downloads the bag.
-
-    After resolving to a DataRef, runs the existing replay engine (``run_replay``)
-    and the metrics pipeline (``_run_metrics_pipeline``), exiting per the B9 verdict.
-    ``module`` is threaded as the existing click.Choice param — never hardcoded.
+    The bag is provided LOCALLY via ``--incident-bag <dir>`` (a rosbag2 dir with
+    metadata.yaml). In CI the gate stages it from the RDS ``s3_bag_uri`` (written by
+    the data-sync platform after upload) and passes that local path — the framework
+    does NOT construct S3 paths (D-22: data_sync owns the S3 layout; there is no
+    canonical incidents/<module>/<incident_id>/ folder). ``--incident-id`` selects
+    verify-ALL mode + stamps the verdict; ``module`` is threaded as the click.Choice.
     """
     # 1. Load module spec — module threaded verbatim (NO hardcode).
     module_spec = load_module_config(module, configs_dir / "modules")
 
-    # 2. Resolve the incident bag to a DataRef (mirror all_cmd:372-382).
+    # 2. Resolve the incident bag to a DataRef. The bag is always provided LOCALLY:
+    # in CI the gate stages it from the RDS s3_bag_uri (data_sync owns the S3 layout,
+    # D-22), so the framework never constructs an S3 path.
     if incident_bag is not None:
         data_ref = resolve_local_bag(incident_bag)
     elif incident_id:
-        if not s3_bucket:
-            raise click.UsageError(
-                "--s3-bucket (or INCIDENT_BAG_BUCKET env var) required to resolve "
-                "--incident-id from S3"
-            )
-        output_dir.mkdir(parents=True, exist_ok=True)
-        data_ref = resolve_incident_bag(
-            incident_id=incident_id,
-            module=module,   # module threaded into the canonical-layout resolver (NO hardcode)
-            bucket=s3_bucket,
-            dest_dir=output_dir,
+        raise click.UsageError(
+            "--incident-id requires --incident-bag: the bag is staged locally from the RDS "
+            "s3_bag_uri (data_sync owns the S3 layout); the framework does not resolve S3 "
+            "paths. In CI the gate downloads the bag, then passes --incident-bag + --incident-id."
         )
     else:
-        raise click.UsageError("Provide --incident-bag OR --incident-id")
+        raise click.UsageError("Provide --incident-bag (with --incident-id for the verdict)")
 
     # 3. Replay — mirrors run_cmd:318-322 + all_cmd:410-424 exit-3 branch.
     result = run_replay(module=module_spec, data=data_ref, output_dir=output_dir)

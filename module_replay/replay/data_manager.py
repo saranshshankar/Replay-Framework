@@ -30,58 +30,6 @@ def resolve_local_bag(bag_dir: Path) -> DataRef:
     return DataRef(local_path=bag_dir, source="local")
 
 
-def resolve_incident_bag(
-    incident_id: str,
-    module: str,
-    bucket: str,
-    dest_dir: Path,
-    *,
-    s3_client=None,
-) -> DataRef:
-    """Download the incident bag at the canonical incidents/<module>/<incident_id>/ key (HLD A5).
-
-    The S3 key layout is `incidents/<module>/<incident_id>/` — NOT resolve_s3_bag's
-    `data/{robot_id}/` layout. The injectable ``s3_client=None`` (default
-    ``boto3.client("s3")``) is the testability seam: tests pass a FAKE client whose
-    paginator/download_file write files into dest_dir — no live S3, no boto3 network
-    in unit tests (T-0101-02).
-
-    Raises FileNotFoundError when the incident prefix lists no objects (mirrors
-    resolve_s3_bag's no-match raise — T-0101-03 no silent partial-download surface).
-    """
-    import boto3
-
-    client = s3_client or boto3.client("s3")
-    incident_prefix = f"incidents/{module}/{incident_id}/"  # HLD A5 — NOT data/{robot_id}/
-
-    local_bag_dir = dest_dir / incident_id / "bag"
-    local_bag_dir.mkdir(parents=True, exist_ok=True)
-
-    found = False
-    paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=incident_prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            relative = key[len(incident_prefix):]
-            if not relative:
-                continue
-            local_file = local_bag_dir / relative
-            local_file.parent.mkdir(parents=True, exist_ok=True)
-            client.download_file(bucket, key, str(local_file))
-            found = True
-
-    if not found:
-        raise FileNotFoundError(
-            f"No incident bag found at s3://{bucket}/{incident_prefix}"
-        )
-
-    return DataRef(
-        local_path=local_bag_dir,
-        source="s3",
-        s3_uri=f"s3://{bucket}/{incident_prefix}",
-    )
-
-
 def resolve_s3_bag(
     task_id: str,
     robot_id: str,

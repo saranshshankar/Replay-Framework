@@ -368,12 +368,19 @@ B6 branch protection.** B7 is a troubleshooting matrix.
 > + `colored_pointcloud_sim` (breach_count 7, max_gap 500 > 250); the re-run was clean; camera
 > RGB/semantic were never affected. This is the **validity tier working as designed** — exit 2 means
 > "infra-noisy replay, don't trust it as a regression signal" — but a blocking PR gate / incident `mark`
-> that lands on INVALID would non-deterministically block a clean PR. **Recommended fix: add a
-> retry-on-INVALID step** to the gate's replay+metrics (and the incident replay): on exit 2, re-run the
-> replay up to N times; only surface INVALID if it persists. Do **not** relax the depth/pointcloud gap
-> tolerance to hide it (owner decision: keep thresholds strict — depth isn't produced yet; threshold
-> recalibration is Aniket's call). This is unimplemented — decide it during B3. See `01.2-STAGE-A-RESULTS.md`
-> Finding 3.
+> that lands on INVALID would non-deterministically block a clean PR.
+>
+> ✔ **IMPLEMENTED 2026-07-01 (`replay-perception-gate.yml`):** the **golden** replay retries on INVALID
+> (`REPLAY_RETRIES=2` → up to 3 attempts) and only hands a **VALID** bag to the downstream `metrics`
+> job — so the golden gate's red/green now reflects **quality only** (a real regression), never a
+> transient stall. A quality FAIL (metrics rc=1) is a real regression and is kept immediately (never
+> retried). The **incident** branch does the same per bag: it retries while the verdict is
+> `inconclusive` (the INVALID-equivalent) so the `mark` AND-gate sees a definitive `fixed`/`not_fixed`.
+> If all attempts are INVALID (a *persistent*, not transient, breach) the job fails as **infra** (clear
+> `::error::` for a human) — never a silent pass. Thresholds stay strict (owner: depth not produced
+> yet; recalibration is Aniket's call). Suite still green (357 passed). See `01.2-STAGE-A-RESULTS.md`
+> Finding 3. **In B3, confirm the retry fires** by watching a dispatch where one attempt logs the
+> `INVALID … retrying` warning and a later attempt goes VALID.
 
 ---
 
@@ -751,7 +758,7 @@ gh api -X PATCH repos/OriginAutonomy/10xCode/branches/<branch>/protection/requir
 | **OIDC `AssumeRoleWithWebIdentity` denied** | trust `sub` doesn't match, or provider missing | Confirm the trust `sub` is `repo:OriginAutonomy/10xCode:*` and the OIDC provider exists (B0.3a) |
 | **psql** connection refused / auth | RDS security group, sslmode, or `gate_user` grants | Test `psql "$INCIDENT_DB_URL" -c 'select 1'` from a runner-like network; add `?sslmode=require`; re-check B1 grants |
 | gate is **green but should've caught a regression** | the regression isn't in a **gated** metric (e.g. `depth_validity` is ungated by design) | Confirm which metric moved; only gated thresholds fail the golden gate — see Appendix B |
-| gate **red** / incident **`inconclusive`** from a **transient** ~500 ms depth/pointcloud stall (INVALID, exit 2) | validity tier caught infra noise, not a regression (Stage-A Finding 3); ~1-in-4 on the box | **retry-on-INVALID**: re-run the replay on exit 2 before surfacing the verdict (design it in B3). Do NOT relax depth/pointcloud gap tolerance (owner: keep strict; depth not produced yet) |
+| gate **red** / incident **`inconclusive`** from a **transient** ~500 ms depth/pointcloud stall (INVALID, exit 2) | validity tier caught infra noise, not a regression (Stage-A Finding 3); ~1-in-4 on the box | **Already handled** — the replay job retries on INVALID (`REPLAY_RETRIES=2`) so a VALID bag reaches metrics/mark. If it still goes red, all 3 attempts were INVALID → a *persistent* infra/runner problem (check `nvidia-smi`, runner disk/IO, the `::error::` line), not the PR. Do NOT relax gap tolerance (owner: keep strict) |
 | privileged jobs **skipped on a PR** | the PR is from a **fork** (fork guard `head.repo==repo`) | Push the branch internally to 10xCode; forks intentionally can't get GPU/secrets |
 | gate **runs on an unrelated PR** / doesn't run on a perception PR | `paths:` filter mismatch | Align the `paths:` + `dorny/paths-filter` block with where perception lives (B2) |
 

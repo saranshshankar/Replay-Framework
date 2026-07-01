@@ -272,45 +272,96 @@ jobs:
             aws s3 cp --recursive "$uri" "$dest"
           done < /tmp/incident_bags.tsv
 
-      - name: "Incident branch: replay each incident bag (sharded, not fail-fast — D-18)"
+      - name: "Incident branch: replay each incident bag (sharded, not fail-fast — D-18; retry-on-INVALID)"
         id: replay_incident_bags
         if: needs.detect.outputs.incident_ids != ''
         env:
           INCIDENT_DB_URL: ${{ secrets.INCIDENT_DB_URL }}
+          REPLAY_RETRIES: "2"   # N=2 retries when a bag's verdict is 'inconclusive' (INVALID replay — 01.2 Finding 3)
         run: |
-          # Run ALL tagged incident bags.  Each bag's exit code is captured separately;
-          # all run regardless of individual failures (not fail-fast, D-18).
-          # The AND-gate is applied in the next step from metrics.json verdict keys.
-          FAIL=0
+          # Run ALL tagged incident bags (sharded, not fail-fast — D-18). Each bag's exit code is
+          # captured separately; all run regardless of individual failures. The AND-gate is applied
+          # in the next step from metrics.json verdict keys.
+          #
+          # RETRY-ON-INVALID (01.2 Finding 3): an 'inconclusive' verdict is the incident-branch
+          # equivalent of an INVALID replay (a transient validity breach), NOT a real signature —
+          # re-run up to N times so the `mark` AND-gate sees a definitive fixed/not_fixed verdict
+          # and never blocks (or clears) a PR on infra noise. A crashed replay (no metrics.json)
+          # yields an empty verdict and is NOT retried (the mark job treats non-'fixed' as blocking).
+          attempts=$((REPLAY_RETRIES + 1))
           while IFS=$'\t' read -r iid uri; do
             out="/tmp/incident_out/${iid}"
-            mkdir -p "$out"
             bag="/tmp/incident_bags/${iid}"
-            echo "=== Replaying incident $iid ==="
-            cd replay-framework/module_replay
-            # --incident-bag: the RDS-authoritative staged bag (the DB stays the single source
-            # of truth for WHERE the bag is). --incident-id: stamps the verdict + triggers the
-            # verify-against-ALL-detectors mode (D-21 — the conditions come from config, not the
-            # RDS; the gate runs the whole detector set and "fixed" == no detector trips).
-            replay-module incident \
-              --module "$MODULE" \
-              --incident-bag "$bag" \
-              --incident-id "$iid" \
-              --output "$out" \
-              --version-yaml /tmp/version.yaml || true   # collect all, AND-gate below
-            cd "$GITHUB_WORKSPACE"
+            for i in $(seq 1 "$attempts"); do
+              echo "=== Replaying incident $iid (attempt ${i}/${attempts}) ==="
+              rm -rf "$out"; mkdir -p "$out"
+              cd replay-framework/module_replay
+              # --incident-bag: the RDS-authoritative staged bag (the DB stays the single source
+              # of truth for WHERE the bag is). --incident-id: stamps the verdict + triggers the
+              # verify-against-ALL-detectors mode (D-21 — conditions come from config, not the RDS;
+              # the gate runs the whole detector set and "fixed" == no detector trips).
+              replay-module incident \
+                --module "$MODULE" \
+                --incident-bag "$bag" \
+                --incident-id "$iid" \
+                --output "$out" \
+                --version-yaml /tmp/version.yaml || true   # collect all, AND-gate below
+              cd "$GITHUB_WORKSPACE"
+              verdict=$(python3 -c "import json; d=json.load(open('${out}/reports/metrics.json')); print((d.get('incident_verdict') or {}).get('verdict',''))" 2>/dev/null || echo "")
+              if [ "$verdict" != "inconclusive" ]; then
+                echo "incident $iid verdict=${verdict:-<none>} (definitive) — keeping."
+                break
+              fi
+              echo "::warning::incident $iid inconclusive (INVALID replay) on attempt ${i}/${attempts} — retrying (01.2 Finding 3)."
+            done
           done < /tmp/incident_bags.tsv
 
       # GOLDEN BRANCH (A4.2) — replays when NO incidents are tagged on the PR.
-      # The existing golden path: replay-module all with the curated golden bag.
-      - name: "Golden branch: replay this PR's perception (no incidents tagged)"
+      # RETRY-ON-INVALID (01.2 Stage-A Finding 3): a transient ~500 ms stall on the depth /
+      # colored_pointcloud topics yields an INVALID (validity-tier) verdict that is INFRA NOISE,
+      # not a code regression (observed ~1-in-4 on the sim box; camera RGB/semantic never affected).
+      # Re-run the replay up to N times until the RECORDED BAG IS VALID, so the downstream cheap
+      # `metrics` job only ever sees a VALID bag and its red/green reflects QUALITY (a real
+      # regression) — never a transient hiccup. A quality FAIL (metrics rc=1) is a REAL regression
+      # and is kept immediately (never retried). Thresholds stay strict (owner: depth not yet
+      # produced by perception; recalibration is a separate, Aniket-owned decision).
+      - name: "Golden branch: replay this PR's perception (retry-on-INVALID → hand a VALID bag downstream)"
         if: needs.detect.outputs.incident_ids == ''
+        env:
+          REPLAY_RETRIES: "2"   # N=2 retries on INVALID → up to 3 attempts total
         run: |
           cd replay-framework/module_replay
-          replay-module all --module "$MODULE" \
-            --version-yaml /tmp/version.yaml \
-            --local-bag "$BAG" \
-            --output /tmp/output
+          valid=0
+          attempts=$((REPLAY_RETRIES + 1))
+          for i in $(seq 1 "$attempts"); do
+            echo "=== Golden replay attempt ${i}/${attempts} ==="
+            rm -rf /tmp/output /tmp/validitycheck
+            # Replay only (metrics stay in the cheap downstream job); writes /tmp/output/replay_output.
+            # A setup/replay error (exit 3) is NOT a validity breach — let it fail fast (set -e).
+            replay-module all --module "$MODULE" \
+              --version-yaml /tmp/version.yaml \
+              --local-bag "$BAG" \
+              --output /tmp/output
+            # Offline validity check: compute metrics and read the B9 exit code.
+            #   0 = PASS, 1 = quality FAIL -> BOTH are VALID replays -> keep this bag
+            #   2 = INVALID (validity breach, e.g. a transient stall) -> retry
+            set +e
+            replay-module metrics --module "$MODULE" \
+              --bag /tmp/output/replay_output --output /tmp/validitycheck
+            rc=$?
+            set -e
+            if [ "$rc" -ne 2 ]; then
+              echo "Replay VALID (validity check rc=${rc}) — handing this bag to the metrics job."
+              valid=1
+              break
+            fi
+            echo "::warning::Golden replay INVALID (rc=2 validity breach) on attempt ${i}/${attempts} — retrying (01.2 Finding 3)."
+          done
+          if [ "$valid" -ne 1 ]; then
+            echo "::error::No VALID replay in ${attempts} attempts — a PERSISTENT (not transient) validity breach. Failing the gate for a human to investigate the runner/infra (not the PR)."
+            exit 1
+          fi
+          cd "$GITHUB_WORKSPACE"
 
       - uses: actions/upload-artifact@v4
         with:

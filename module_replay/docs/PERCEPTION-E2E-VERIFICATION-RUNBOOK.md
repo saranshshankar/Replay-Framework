@@ -131,6 +131,12 @@ input topics `camera_{0,1,3,4,5,6}`, tenxcode branch = your branch.
 This is the decisive local run. It checks out + builds perception in the container, replays the bag
 through the live EoMT pipeline on GPU, records the `_sim` output, computes metrics, and gates.
 
+> ✔ **RAN 2026-07-01 on simp-c-3 (RTX 4080) → clean VALID + PASS (exit 0).** 33 GB output bag, 6 cams
+> all producing RGB+semantic+depth `_sim`. B2/B3/B4 confirmed healed: `drop_rate 0.0`, `max_gap 200/breach 0`,
+> `latency_p95 8.263 ms` (gated PASS), `pipeline 9.994`, `segmentation 0.096`, `overlap 0.6081` (PASS@0.55),
+> `depth_validity 0.0` (ungated, `passed=None`), `mask_iou_vs_golden` skipped. Full record:
+> `.planning/phases/01.2-…/01.2-STAGE-A-RESULTS.md`. Re-run on the sim box to reconfirm on any code change.
+
 ```bash
 replay-module all --module perception \
   --version-yaml configs/versions/perception-ci-e2e.yaml \
@@ -164,11 +170,13 @@ print('drop_rate=',d['replay_faithfulness']['drop_rate'],'breach=',d['replay_fai
 `📸 CAPTURE:` copy `/tmp/run1/reports/` (metrics.json + report.html) into the phase evidence dir
 `.planning/phases/01.2-perception-e2e-verification-ci-enablement/e2e-local/` for the sign-off record.
 
-> ⚠️ **GOTCHA — expected verdict may still be `FAIL` (exit 1), and that's OK for SC1.** SC1 proves
-> the verdict is *trustworthy and itemized*, not that it's green. If `depth_raw_sim` is genuinely
-> all-zero again (a real perception issue, deliberately **not** gated in the quality tier), the run
-> can still be VALID. What must NOT happen: an INVALID (exit 2) driven by the old drop-rate inflation.
-> A VALID verdict (green or an honest quality FAIL) = SC1 satisfied.
+> ⚠️ **GOTCHA — a `FAIL` (exit 1) would still satisfy SC1.** SC1 proves the verdict is *trustworthy
+> and itemized*, not that it's green. `depth_raw_sim` is genuinely all-zero (a real perception issue,
+> deliberately **not** gated in the quality tier) — the run stays VALID regardless. What must NOT
+> happen: an INVALID (exit 2) driven by the old drop-rate inflation. *(2026-07-01 the real run came
+> back a clean VALID+PASS — stronger than this floor.)* But see the **transient-INVALID finding** in
+> Stage B: an occasional exit-2 from a transient depth/pointcloud stall is the validity tier working
+> as designed, not a regression — CI must retry on it.
 
 ### A4 — Prove the quality gate BITES (cheap offline path, no GPU)
 
@@ -219,12 +227,19 @@ ls -la /tmp/viz/viz/*.mp4
 
 `✅ EXPECT:` decodable `.mp4`s render (overlap-video + the 2×2 semantic/depth/temporal grids). Viz
 never affects the verdict (exit always 0).
+> ✔ **RAN 2026-07-01 → 7 mp4s** (`overlap_cam2_cam3` + `combined_cam0..5`), ffmpeg-decode verified.
 
 ### A7 · SC-INCIDENT — the net-new incident loop (the point of this branch)
 
 The incident subcommand replays a bag and writes an additive
 `metrics.json["incident_verdict"]` = `fixed` | `not_fixed` | `inconclusive`. The 5 perception
 detectors (`configs/modules/perception.yaml → incident_detectors`) are:
+
+> ✔ **RAN 2026-07-01 → all three verdict states proven live:** A7a `--incident-key seg_all_background`
+> → `fixed` (tripped `[]`); A7b `--incident-id` all-5 → `not_fixed` (tripped `["depth_all_zero"]` —
+> the real all-zero-depth signature, exercising the AND-gate); A7c forced `fps_collapse` → `inconclusive`
+> on a transient INVALID replay (proving the "never-confirm-on-INVALID" guard), then `not_fixed` on the
+> clean re-run. This is exactly the JSON the CI `mark`/`sweep` jobs read.
 
 | Detector | Condition | Fires when |
 |----------|-----------|-----------|
@@ -347,6 +362,18 @@ from **GHCR**, and runtime assets come from **S3**. Five files ship in `module_r
 
 Work top-to-bottom: **B0 provisioning → B1 RDS → B2 deploy → B3 dry-run → B4 SC2 → B5 incident loop →
 B6 branch protection.** B7 is a troubleshooting matrix.
+
+> ⚠️ **Carry this Stage-A finding into Stage B — transient-INVALID gate stability.** On the sim box,
+> 1 of 4 GPU replays came back **INVALID (exit 2)** from a transient ~500 ms gap on all 6 `depth_raw_sim`
+> + `colored_pointcloud_sim` (breach_count 7, max_gap 500 > 250); the re-run was clean; camera
+> RGB/semantic were never affected. This is the **validity tier working as designed** — exit 2 means
+> "infra-noisy replay, don't trust it as a regression signal" — but a blocking PR gate / incident `mark`
+> that lands on INVALID would non-deterministically block a clean PR. **Recommended fix: add a
+> retry-on-INVALID step** to the gate's replay+metrics (and the incident replay): on exit 2, re-run the
+> replay up to N times; only surface INVALID if it persists. Do **not** relax the depth/pointcloud gap
+> tolerance to hide it (owner decision: keep thresholds strict — depth isn't produced yet; threshold
+> recalibration is Aniket's call). This is unimplemented — decide it during B3. See `01.2-STAGE-A-RESULTS.md`
+> Finding 3.
 
 ---
 
@@ -724,6 +751,7 @@ gh api -X PATCH repos/OriginAutonomy/10xCode/branches/<branch>/protection/requir
 | **OIDC `AssumeRoleWithWebIdentity` denied** | trust `sub` doesn't match, or provider missing | Confirm the trust `sub` is `repo:OriginAutonomy/10xCode:*` and the OIDC provider exists (B0.3a) |
 | **psql** connection refused / auth | RDS security group, sslmode, or `gate_user` grants | Test `psql "$INCIDENT_DB_URL" -c 'select 1'` from a runner-like network; add `?sslmode=require`; re-check B1 grants |
 | gate is **green but should've caught a regression** | the regression isn't in a **gated** metric (e.g. `depth_validity` is ungated by design) | Confirm which metric moved; only gated thresholds fail the golden gate — see Appendix B |
+| gate **red** / incident **`inconclusive`** from a **transient** ~500 ms depth/pointcloud stall (INVALID, exit 2) | validity tier caught infra noise, not a regression (Stage-A Finding 3); ~1-in-4 on the box | **retry-on-INVALID**: re-run the replay on exit 2 before surfacing the verdict (design it in B3). Do NOT relax depth/pointcloud gap tolerance (owner: keep strict; depth not produced yet) |
 | privileged jobs **skipped on a PR** | the PR is from a **fork** (fork guard `head.repo==repo`) | Push the branch internally to 10xCode; forks intentionally can't get GPU/secrets |
 | gate **runs on an unrelated PR** / doesn't run on a perception PR | `paths:` filter mismatch | Align the `paths:` + `dorny/paths-filter` block with where perception lives (B2) |
 
@@ -745,17 +773,17 @@ gh api -X PATCH repos/OriginAutonomy/10xCode/branches/<branch>/protection/requir
 
 Perception is signed off when **all** hold and evidence is captured:
 
-| # | Criterion | Where proven |
-|---|-----------|--------------|
-| SC1 | Faithful isolated replay → trustworthy itemized verdict (B2/B3/B4 healed) | A3 |
-| SC-Q | Quality gate demonstrably bites | A4 |
-| SC4 | Two replays agree within tolerance | A5 / B3 nightly |
-| VIZ | Tier-3 debug videos render | A6 / B3 viz |
-| SC-INC | Incident loop verdict correct both directions; live mark + sweep | A7 / B5 |
-| SC2 | Live CI red on bad PR, green on clean, neutral-skip on untouched | B4 |
-| SC3 | Nightly smoke green | B3 |
-| DOCS | Stale docs reconciled ([Appendix C](#appendix-c--what-changed-vs-the-old-docs)) | — |
-| UAT | Owner sign-off recorded in `01-HUMAN-UAT.md` (closes the SC2–SC4 items) | — |
+| # | Criterion | Where proven | Status (2026-07-01) |
+|---|-----------|--------------|---------------------|
+| SC1 | Faithful isolated replay → trustworthy itemized verdict (B2/B3/B4 healed) | A3 | ✅ clean VALID+PASS |
+| SC-Q | Quality gate demonstrably bites | A4 (manual) / offline suite | ⏭ A4 skipped; covered by the A1 suite (`test_metrics_report`, exit-code paths, `test_e2e_negative_control`) |
+| SC4 | Two replays agree within tolerance | A5 / B3 nightly | ⏭ A5 skipped → **prove via the nightly determinism step in B3** (only data so far: 3 VALID/1 transient-INVALID) |
+| VIZ | Tier-3 debug videos render | A6 / B3 viz | ✅ 7 mp4s |
+| SC-INC | Incident loop verdict correct both directions; live mark + sweep | A7 / B5 | ✅ all 3 states local (A7); ◻ live mark+sweep (B5) |
+| SC2 | Live CI red on bad PR, green on clean, neutral-skip on untouched | B4 | ◻ Stage B |
+| SC3 | Nightly smoke green | B3 | ◻ Stage B |
+| DOCS | Stale docs reconciled ([Appendix C](#appendix-c--what-changed-vs-the-old-docs)) | — | ◻ open |
+| UAT | Owner sign-off recorded in `01-HUMAN-UAT.md` (closes the SC2–SC4 items) | — | ◻ open |
 
 When these are checked, run `/gsd-verify-work` for phase 01.2 and mark the phase complete, then
 transition to **Phase 2: Sensor Fusion + Localization**.

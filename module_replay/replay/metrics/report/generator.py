@@ -144,6 +144,7 @@ def generate_report(
     run_artifacts: Optional[dict] = None,
     reader=None,
     visualizations: Optional[list] = None,
+    incident_spec: Optional[dict] = None,
 ) -> int:
     """Evaluate metrics vs thresholds, AND-gate quality, write artifacts, return the B9 exit code.
 
@@ -279,6 +280,51 @@ def generate_report(
     else:
         details = "all configured criteria passed"
 
+    # ── Additive incident verdict (01.1 — config-as-checkset, D-21) ───────────
+    # The incident gate replays a failure's bag and runs EVERY known-failure
+    # detector in incident_spec["checks"] (authored in module config, once per
+    # failure type). "fixed" == VALID AND no detector trips. Golden-quality
+    # thresholds are deliberately NOT required on a (degraded) incident bag —
+    # the bar is "the catastrophic signatures are gone", not full golden quality
+    # (the knob). doc["pass"], doc["verdict"], and the B9 exit code are byte-for-
+    # byte unchanged — the incident outcome rides ONLY this additive key
+    # (T-0104-03: overloading doc["pass"] is a landmine — the golden gate reads it).
+    # incident_spec=None is the golden-path no-op.
+    incident_verdict = None
+    if incident_spec is not None:
+        from replay.metrics.incident_verifier import evaluate_incident
+
+        checks = incident_spec.get("checks") or {}
+        tripped = []        # detectors whose known-failure condition still breaches
+        uncomputable = []   # detectors whose metric was not computed this run
+        for key, detector in checks.items():
+            # evaluate_incident dispatches on verifier_type; an error_code detector
+            # with a missing code returns reproduced=False (D-14 — never trips/blocks).
+            r = evaluate_incident(detector, metric_results)
+            if r.get("uncomputable"):
+                uncomputable.append(key)
+            elif r.get("reproduced") is True:
+                tripped.append(key)
+
+        if not validity_pass:
+            # never-fixed-on-INVALID: a flaky/degraded run can't confirm a fix.
+            iv = "inconclusive"
+        elif tripped:
+            iv = "not_fixed"       # ≥1 known catastrophic failure still present
+        elif uncomputable:
+            iv = "inconclusive"    # couldn't verify every detector → don't claim fixed
+        else:
+            iv = "fixed"           # VALID + no known failure present (quality NOT required — the knob)
+
+        incident_verdict = {
+            "incident_id": incident_spec.get("incident_id"),
+            "verdict": iv,
+            "mode": incident_spec.get("mode", "all"),
+            "tripped": tripped,             # which known failures are still present (diagnostic)
+            "uncomputable": uncomputable,   # detectors whose metric was not computed
+            "verifier_type": incident_spec.get("verifier_type", "metric_condition"),
+        }
+
     # ── Additive presentation layer (A1/A3) ────────────────────────────────
     # These keys are NEW and never rename/remove a contract key. The CI gate
     # reads doc["pass"]/doc["verdict"]/the rows; it ignores everything below.
@@ -297,7 +343,7 @@ def generate_report(
     doc = {
         "module": module,
         "run_id": run_id,
-        "pass": overall,
+        "pass": overall,                      # DO NOT TOUCH — gate.yml:144 reads this key
         "replay_faithfulness": faith_block,
         "metrics": rows,
         "verdict": verdict,
@@ -309,6 +355,9 @@ def generate_report(
         # Tier-3 viz (additive, never gated): report-relative mp4 links when the
         # --run-viz / viz path produced them, else None -> the template shows a hint.
         "visualizations": visualizations,
+        # Additive incident verdict (01.1-04 / FR-6): None when incident_spec is
+        # absent (golden path). NEVER overloads doc["pass"] — T-0104-03.
+        "incident_verdict": incident_verdict,
     }
     # metrics.json is the machine-read gate signal (CI reads doc["pass"] / verdict).
     # json.dumps cannot be HTML-injected, so the values pass through untransformed.

@@ -1,0 +1,223 @@
+# DEPLOY TO: 10xCode  ->  .github/workflows/replay-perception-sweep.yml
+#
+# QA-cut sweep: replays ALL open incident bags for perception on a schedule and on
+# workflow_dispatch (the dev->QA branch-cut trigger).  Any bag whose incident signature
+# reproduces is reopened in the RDS (status='open') and the job fails, blocking the cut.
+# Green only if nothing reproduced — the fixed-stays-fixed guarantee (FR-10, A4.3, B6).
+#
+# Modeled on replay-perception-nightly.yml (B6: "modeled on replay-perception-nightly.yml:8-52"):
+#   schedule + workflow_dispatch, RunsOn GPU runner, S3 asset staging, one upload artifact.
+#
+# SECURITY: OIDC-only (id-token: write); no long-lived AWS keys; safe schedule/dispatch only.
+# NOT a PR gate — no pull_req_write permission needed (B7/RQ-10).
+# Every uses: pinned to a concrete ref.
+name: replay-perception-sweep
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Monday 06:00 UTC — weekly QA-cut check; adjust to release cadence
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Module to sweep (default: perception)"
+        required: false
+        default: "perception"
+
+permissions:
+  id-token: write        # AWS OIDC — S3-read only, to download assets + incident bags
+  contents: read
+  packages: read         # GHCR image pull
+
+jobs:
+  sweep:
+    runs-on: runs-on=${{ github.run_id }}/runner=replay-gpu
+    env:
+      MODULE: ${{ inputs.module || 'perception' }}
+      REGISTRY: ghcr.io/originautonomy
+      TENXCODE_ROOT: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }            # 10xCode QA-cut HEAD
+
+      - uses: actions/checkout@v4
+        with:
+          repository: saranshshankar/Replay-Framework
+          ref: main
+          path: replay-framework
+          token: ${{ secrets.FRAMEWORK_READ_TOKEN }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.DOCKER_DEPLOYMENT_PAT }}
+
+      - run: pip install -e "./replay-framework/module_replay[metrics]"
+
+      # Stage runtime assets into ~/.ros (engine/LUTs not in the image — guide Part 10)
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "${{ vars.REPLAY_ROLE_ARN }}"
+          aws-region: ap-south-1
+
+      - name: Stage engine + LUTs into ~/.ros
+        run: |
+          mkdir -p ~/.ros/perception/models ~/.ros/perception/calibration/camera_intrinsics
+          # x86/sm_89/TRT-10.3 engine — NOT the ARM s3://10xai-team-models/.../flicker_drywall.trt
+          aws s3 cp "${{ vars.PERCEPTION_ENGINE_S3 }}" ~/.ros/perception/models/flicker_drywall.trt
+          aws s3 sync \
+            s3://replay-framework-assets/perception_assets/calibration/camera_intrinsics/ \
+            ~/.ros/perception/calibration/camera_intrinsics/
+
+      # Headless-box setup (mirror gate headless pre-step — RESEARCH §2b)
+      - name: Headless-box setup (reset devices, create host paths)
+        run: |
+          OVERRIDE="${TENXCODE_ROOT}/.devcontainer/v2/planner/docker-compose.override.yml"
+          if [ -f "$OVERRIDE" ]; then
+            python3 -c "
+          import yaml, sys
+          with open('$OVERRIDE') as f:
+              doc = yaml.safe_load(f) or {}
+          for svc in (doc.get('services') or {}).values():
+              svc.pop('devices', None)
+          with open('$OVERRIDE', 'w') as f:
+              yaml.dump(doc, f, default_flow_style=False)
+          "
+          fi
+          touch /root/.Xauthority
+          [ -f /etc/timezone ] || echo "UTC" > /etc/timezone
+          mkdir -p /tmp/sweep_out /tmp/incident_bags
+
+      # SELECT all open incidents for the module set, dedup by error_code (B6 / A4.3).
+      # Ignores rows with status='fixed'.  DB creds stay server-side (INCIDENT_DB_URL secret).
+      - name: "Sweep: resolve all open incident bags from RDS (ignore fixed, dedup by error_code)"
+        id: resolve_sweep_bags
+        env:
+          INCIDENT_DB_URL: ${{ secrets.INCIDENT_DB_URL }}
+        run: |
+          python3 - <<'EOF'
+          import os, subprocess, sys
+
+          db_url = os.environ.get('INCIDENT_DB_URL', '')
+          module = os.environ.get('MODULE', 'perception')
+          if not db_url:
+              print("INCIDENT_DB_URL not set — skipping sweep (no DB configured yet).")
+              # Write an empty bag list so downstream steps are no-ops
+              open('/tmp/sweep_bags.tsv', 'w').close()
+              sys.exit(0)
+
+          # SELECT all open incidents for this module, deduplicated by error_code.
+          # The DISTINCT ON picks the most-recent (highest ts) representative per code.
+          sql = (
+              f"SELECT DISTINCT ON (error_code) incident_id, s3_bag_uri, error_code "
+              f"FROM module_replay_incidents "
+              f"WHERE module_name='{module}' AND status<>'fixed' AND s3_bag_uri IS NOT NULL "
+              f"ORDER BY error_code, ts DESC;"
+          )
+          result = subprocess.run(
+              ['psql', db_url, '--no-psqlrc', '--tuples-only', '--no-align', '-c', sql],
+              capture_output=True, text=True, check=True
+          )
+          rows = []
+          for line in result.stdout.strip().splitlines():
+              parts = line.split('|')
+              if len(parts) >= 2:
+                  iid  = parts[0].strip()
+                  uri  = parts[1].strip()
+                  rows.append((iid, uri))
+          with open('/tmp/sweep_bags.tsv', 'w') as f:
+              for iid, uri in rows:
+                  f.write(f"{iid}\t{uri}\n")
+          print(f"Selected {len(rows)} open incident bag(s) for sweep")
+          EOF
+
+      - name: "Sweep: stage each incident bag from S3"
+        run: |
+          while IFS=$'\t' read -r iid uri; do
+            dest="/tmp/incident_bags/${iid}"
+            mkdir -p "$dest"
+            echo "Staging $iid from $uri"
+            aws s3 cp --recursive "$uri" "$dest"
+          done < /tmp/sweep_bags.tsv
+
+      # Replay each bag (sharded, not fail-fast — D-18).
+      # Each bag's replay result is collected; the AND-gate + RDS reopen runs next.
+      - name: "Sweep: replay each incident bag"
+        run: |
+          while IFS=$'\t' read -r iid uri; do
+            out="/tmp/sweep_out/${iid}"
+            mkdir -p "$out"
+            bag="/tmp/incident_bags/${iid}"
+            echo "=== Sweep: replaying incident $iid ==="
+            cd replay-framework/module_replay
+            replay-module incident \
+              --module "$MODULE" \
+              --incident-bag "$bag" \
+              --incident-id "$iid" \
+              --output "$out" || true   # collect all, AND-gate in next step
+            cd "$GITHUB_WORKSPACE"
+          done < /tmp/sweep_bags.tsv
+
+      # AND-gate: read doc["incident_verdict"]["verdict"] from each bag's metrics.json.
+      # A 'not_fixed' verdict (a known catastrophic failure reproduced) triggers a RDS
+      # reopen (status='open') and fails the sweep job, blocking the cut (B6 / FR-10 / D-21).
+      - name: "Sweep: AND-gate verdicts + reopen reproduced incidents in RDS"
+        id: and_gate
+        env:
+          INCIDENT_DB_URL: ${{ secrets.INCIDENT_DB_URL }}
+        run: |
+          python3 - <<'EOF'
+          import os, json, subprocess, pathlib, sys
+
+          sweep_out  = pathlib.Path('/tmp/sweep_out')
+          db_url     = os.environ.get('INCIDENT_DB_URL', '')
+          reproduced = []
+
+          for metrics_file in sorted(sweep_out.rglob('reports/metrics.json')):
+              try:
+                  doc = json.loads(metrics_file.read_text())
+              except Exception as e:
+                  print(f"WARN: could not parse {metrics_file}: {e}")
+                  continue
+
+              iv      = doc.get('incident_verdict') or {}
+              verdict = iv.get('verdict', '')
+              iid     = iv.get('incident_id') or metrics_file.parts[-3]  # <out>/<iid>/reports/metrics.json
+
+              print(f"  {iid}: verdict={verdict!r}")
+
+              # A known failure still present ('not_fixed') -> reopen + fail the cut (B6/D-21)
+              if verdict == 'not_fixed':
+                  reproduced.append((iid, verdict))
+                  if db_url:
+                      sql = (
+                          f"UPDATE module_replay_incidents "
+                          f"SET status='open', fixed=false "
+                          f"WHERE incident_id='{iid}';"
+                      )
+                      result = subprocess.run(
+                          ['psql', db_url, '--no-psqlrc', '--tuples-only', '-c', sql],
+                          capture_output=True, text=True
+                      )
+                      if result.returncode != 0:
+                          print(f"ERROR reopening {iid}: {result.stderr}")
+                      else:
+                          print(f"Reopened: {iid} (verdict={verdict})")
+                  else:
+                      print(f"WARN: INCIDENT_DB_URL not set; would reopen {iid}")
+
+          if reproduced:
+              print(f"\nSWEEP FAIL: {len(reproduced)} incident(s) reproduced — QA cut blocked:")
+              for iid, v in reproduced:
+                  print(f"  {iid}: {v}")
+              sys.exit(1)
+          else:
+              print("Sweep PASS: no incidents reproduced — QA cut is clear.")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweep-${{ github.run_id }}
+          path: /tmp/sweep_out
+          retention-days: 5

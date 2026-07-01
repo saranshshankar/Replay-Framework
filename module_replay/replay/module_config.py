@@ -50,6 +50,11 @@ class ModuleSpec:
     # Gap-closure (01-19): per-topic breach tolerance + the diagnostics stage LatencyMetric reads.
     gap_tolerance: dict = field(default_factory=dict)  # topic-substring -> breach gap factor (default 2.0)
     latency_stage: Optional[str] = None               # diagnostics stage name LatencyMetric parses
+    # Incident verification (01.1): per-incident metric-conditions over the existing
+    # metrics (D-13), and the OPTIONAL error-code capture label (D-14 — a missing code
+    # NEVER blocks the gate). Both defaulted so 6-field callers stay valid.
+    incident_detectors: dict = field(default_factory=dict)  # incident_id -> {metric, field, op, threshold, ...}
+    error_code_topic: Optional[str] = None                  # optional capture label only; never gated
 
 
 def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
@@ -101,6 +106,12 @@ def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
     gap_tolerance = data.get("gap_tolerance") or {}
     latency_stage = data.get("latency_stage")
 
+    # Incident verification (01.1): per-incident metric-condition block (D-13) and the
+    # OPTIONAL error-code capture label (D-14). Both read without coercion — the
+    # verifier in plan 04 owns interpretation, mirroring expected_hz/gap_tolerance.
+    incident_detectors = data.get("incident_detectors") or {}
+    error_code_topic = data.get("error_code_topic")
+
     return ModuleSpec(
         name=data["name"],
         container=container,
@@ -118,6 +129,8 @@ def load_module_config(module_name: str, configs_dir: Path) -> ModuleSpec:
         diagnostics_topic=diagnostics_topic,
         gap_tolerance=gap_tolerance,
         latency_stage=latency_stage,
+        incident_detectors=incident_detectors,
+        error_code_topic=error_code_topic,
     )
 
 

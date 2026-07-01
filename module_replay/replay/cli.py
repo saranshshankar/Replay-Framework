@@ -77,6 +77,7 @@ def _run_metrics_pipeline(
     configs_dir: Path = DEFAULT_CONFIGS_DIR,
     run_artifacts: Optional[dict] = None,
     run_viz: bool = False,
+    incident_spec: Optional[dict] = None,
 ) -> int:
     """Run the registered perception plugins + faithfulness over an output bag,
     generate the report, and return the B9 exit code.
@@ -184,14 +185,22 @@ def _run_metrics_pipeline(
         # generate_report's plot rendering; without it the report has no plots.
         reader=reader,
     )
+    # Thread the incident_spec keyword if provided (01.1-04, Task 3).
+    # Only added when non-None so the existing golden-path runs are unaffected.
+    if incident_spec is not None:
+        report_kwargs["incident_spec"] = incident_spec
     try:
         rc = generate_report(**report_kwargs)
-    except TypeError:
-        # Graceful degrade: an older generate_report that predates the additive
-        # run_artifacts / visualizations params. Drop them and render without the
-        # Debug pointer map / viz links rather than crash the run.
+    except TypeError as exc:
+        # Graceful degrade ONLY for an older generate_report that predates the
+        # additive run_artifacts / visualizations / incident_spec params (the
+        # "unexpected keyword argument" TypeError). Re-raise any other TypeError so
+        # genuine bugs inside generate_report are not silently swallowed (WR-01).
+        if "unexpected keyword argument" not in str(exc):
+            raise
         report_kwargs.pop("run_artifacts", None)
         report_kwargs.pop("visualizations", None)
+        report_kwargs.pop("incident_spec", None)
         rc = generate_report(**report_kwargs)
     click.echo(f"Metrics report: {reports_dir / 'report.html'}")
     click.echo(f"Verdict: {_VERDICT_LABELS[rc]}")
@@ -489,6 +498,153 @@ def metrics_cmd(
     )
     if rc != 0:
         sys.exit(rc)  # 1 = quality FAIL, 2 = INVALID RUN — B9 contract
+
+
+@main.command("incident")
+@click.option("--module", required=True, type=click.Choice(["perception", "navigation", "manipulation"]))
+@click.option(
+    "--incident-id",
+    default=None,
+    help="Incident id. Picks the bag (S3 canonical layout incidents/<module>/<incident_id>/ "
+    "when --incident-bag is absent) and stamps the verdict. With no --incident-key it triggers "
+    "the CI default: verify against ALL the module's incident_detectors (fixed iff none trip).",
+)
+@click.option(
+    "--incident-bag",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Local rosbag2 incident-bag dir (must contain metadata.yaml). The cheap local-fixture path.",
+)
+@click.option(
+    "--incident-key",
+    default=None,
+    help="LOCAL-DEBUG: verify against this ONE named entry of module_spec.incident_detectors "
+    "(targeted). CI omits this and passes --incident-id to verify against ALL detectors. "
+    "Falls back to a plain golden-style verdict when the key is not found.",
+)
+@click.option("--version-yaml", type=click.Path(path_type=Path, exists=True), default=None)
+@click.option("--output", "output_dir", required=True, type=click.Path(path_type=Path))
+@click.option("--configs-dir", type=click.Path(path_type=Path, exists=True), default=DEFAULT_CONFIGS_DIR)
+@click.option(
+    "--baseline",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Pinned-golden baseline for regression metrics. A local rosbag2 path is used directly; "
+    "any other value resolves the golden via BaselineManager.",
+)
+def incident_cmd(
+    module: str,
+    incident_id: Optional[str],
+    incident_bag: Optional[Path],
+    incident_key: Optional[str],
+    version_yaml: Optional[Path],
+    output_dir: Path,
+    configs_dir: Path,
+    baseline: Optional[Path],
+) -> None:
+    """Replay an incident bag and run the verdict pipeline.
+
+    The bag is provided LOCALLY via ``--incident-bag <dir>`` (a rosbag2 dir with
+    metadata.yaml). In CI the gate stages it from the RDS ``s3_bag_uri`` (written by
+    the data-sync platform after upload) and passes that local path — the framework
+    does NOT construct S3 paths (D-22: data_sync owns the S3 layout; there is no
+    canonical incidents/<module>/<incident_id>/ folder). ``--incident-id`` selects
+    verify-ALL mode + stamps the verdict; ``module`` is threaded as the click.Choice.
+    """
+    # 1. Load module spec — module threaded verbatim (NO hardcode).
+    module_spec = load_module_config(module, configs_dir / "modules")
+
+    # 2. Resolve the incident bag to a DataRef. The bag is always provided LOCALLY:
+    # in CI the gate stages it from the RDS s3_bag_uri (data_sync owns the S3 layout,
+    # D-22), so the framework never constructs an S3 path.
+    if incident_bag is not None:
+        data_ref = resolve_local_bag(incident_bag)
+    elif incident_id:
+        raise click.UsageError(
+            "--incident-id requires --incident-bag: the bag is staged locally from the RDS "
+            "s3_bag_uri (data_sync owns the S3 layout); the framework does not resolve S3 "
+            "paths. In CI the gate downloads the bag, then passes --incident-bag + --incident-id."
+        )
+    else:
+        raise click.UsageError("Provide --incident-bag (with --incident-id for the verdict)")
+
+    # 3. Replay — mirrors run_cmd:318-322 + all_cmd:410-424 exit-3 branch.
+    result = run_replay(module=module_spec, data=data_ref, output_dir=output_dir)
+    click.echo(f"Output bag: {result.output_bag_path}")
+    if result.logs_dir is not None:
+        click.echo(f"Logs: {result.logs_dir}")
+    if result.exit_code != 0:
+        click.echo(
+            f"Replay failed (container exit code {result.exit_code}) "
+            "— exiting 3 (setup/replay error)",
+            err=True,
+        )
+        if result.logs_dir is not None:
+            click.echo(f"Replay logs: {result.logs_dir}", err=True)
+        sys.exit(3)
+
+    # 4. Assemble the incident check-set (01.1 — config-as-checkset, D-21).
+    #
+    # KNOWN-FAILURE conditions live in module config (incident_detectors, authored
+    # once per failure type by the module owner). The RDS is a plain index
+    # (incident_id + bag + status) and carries NO conditions. The gate replays the
+    # bag and runs the detector set; "fixed" == VALID AND no detector trips.
+    #   - CI default (--incident-id, no --incident-key): verify against ALL the
+    #     module's detectors. incident_id only picks the bag + stamps the verdict.
+    #   - local debug (--incident-key <k>): verify against that ONE detector.
+    # incident_spec=None → plain golden-style report (no incident verdict).
+    detectors = module_spec.incident_detectors
+    assembled_incident_spec = None
+    if incident_key:
+        if incident_key in detectors:
+            assembled_incident_spec = {
+                "incident_id": incident_id or incident_key,
+                "mode": "targeted",
+                "checks": {incident_key: dict(detectors[incident_key])},
+                "verifier_type": detectors[incident_key].get(
+                    "verifier_type", "metric_condition"
+                ),
+            }
+        else:
+            click.echo(
+                f"Notice: incident key '{incident_key}' not found in "
+                f"module_spec.incident_detectors for '{module}' — running without "
+                "incident verdict (plain golden-style report).",
+                err=True,
+            )
+    elif incident_id:
+        if detectors:
+            assembled_incident_spec = {
+                "incident_id": incident_id,
+                "mode": "all",
+                "checks": {k: dict(v) for k, v in detectors.items()},
+                "verifier_type": "metric_condition",
+            }
+        else:
+            click.echo(
+                f"Notice: no incident_detectors configured for '{module}' — running "
+                "without incident verdict (plain golden-style report).",
+                err=True,
+            )
+
+    # 5. Metrics pipeline (B9 contract; plan 04 makes this incident-aware additively).
+    run_artifacts = {
+        "bag": str(result.output_bag_path),
+        "logs": str(result.logs_dir) if result.logs_dir is not None
+        else str(output_dir / "logs"),
+        "report": "report.html",
+    }
+    rc = _run_metrics_pipeline(
+        module_spec,
+        result.output_bag_path,
+        output_dir,
+        baseline=baseline,
+        configs_dir=configs_dir,
+        run_artifacts=run_artifacts,
+        incident_spec=assembled_incident_spec,
+    )
+    if rc != 0:
+        sys.exit(rc)
 
 
 def _run_viz_pipeline(module_spec, bag_path: Path, output_dir: Path) -> list:

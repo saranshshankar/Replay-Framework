@@ -547,40 +547,54 @@ gh variable set PERCEPTION_BAG_PATH   --repo $R --body "/mnt/efs/bags/perception
 
 ### B1 · Create the RDS incidents table + roles → set `INCIDENT_DB_URL`
 
-**(a)** Apply the DDL once (as a DB admin/owner):
+> ✔ **DONE 2026-07-01** on RDS `database-1.cviscog0koyp.ap-south-1.rds.amazonaws.com` (Postgres 17.9).
+> Created a **dedicated** database `module_replay` (the 20 pre-existing DBs were left untouched — verified
+> before/after), applied the DDL there, and created two **least-privilege** login roles scoped to *only*
+> `module_replay_incidents` (non-superuser, no CREATEDB/CREATEROLE — the CI credential can never reach the
+> other databases). Verified: 21 columns, 3 indexes, `replay_gate` = SELECT + UPDATE on
+> `{status,fixed,fixed_by_pr,fixed_by_sha,fixed_by_run,fixed_at}`, `replay_worker` = INSERT + UPDATE(s3_bag_uri).
+> The `INCIDENT_DB_URL` (gate role) was generated in-session. The role names + passwords + full
+> connection URLs are recorded in the **git-ignored** file
+> `.planning/phases/01.2-…/CREDENTIALS.local.md` (roles `replay_gate` / `replay_worker`) — kept out of
+> this tracked doc so they never enter git history. **Set `INCIDENT_DB_URL` as the GitHub secret** from
+> that file (command below).
+
+The exact steps that were run (recorded for reproducibility / other modules):
 
 ```bash
-psql "postgresql://<admin>:<pw>@<rds-host>:5432/<db>" -f module_replay/ci/infra/incidents_table.sql
+HOST=database-1.cviscog0koyp.ap-south-1.rds.amazonaws.com
+MASTER="postgresql://postgres:<master-pw>@${HOST}/postgres"          # admin, default DB
+# 1. dedicated DB (additive — never touches the other databases)
+psql "$MASTER" -c "CREATE DATABASE module_replay;"
+NEWDB="postgresql://postgres:<master-pw>@${HOST}/module_replay?sslmode=require"
+# 2. least-privilege roles (cluster-global logins, no superuser)
+psql "$NEWDB" -c "CREATE ROLE replay_gate   LOGIN PASSWORD '<gate-pw>';"
+psql "$NEWDB" -c "CREATE ROLE replay_worker LOGIN PASSWORD '<worker-pw>';"
+# 3. the idempotent DDL
+psql "$NEWDB" -f module_replay/ci/infra/incidents_table.sql
+# 4. narrow grants (ONLY module_replay / ONLY the incidents table)
+psql "$NEWDB" \
+  -c "GRANT CONNECT ON DATABASE module_replay TO replay_gate, replay_worker;" \
+  -c "GRANT USAGE ON SCHEMA public TO replay_gate, replay_worker;" \
+  -c "GRANT SELECT, UPDATE (status, fixed, fixed_by_pr, fixed_by_sha, fixed_at, fixed_by_run) ON module_replay_incidents TO replay_gate;" \
+  -c "GRANT INSERT, UPDATE (s3_bag_uri) ON module_replay_incidents TO replay_worker;"
 ```
 
-`✅ EXPECT:` table `module_replay_incidents` + two indexes (`module_name,status`, `error_code`),
-idempotent (`IF NOT EXISTS`).
-
-**(b)** Create least-privilege roles and grant:
-
-```sql
-CREATE ROLE gate_user   LOGIN PASSWORD '<gate-pw>';
-CREATE ROLE worker_user LOGIN PASSWORD '<worker-pw>';
--- gate role: SELECT + narrow UPDATE (exactly the columns the mark/sweep jobs write)
-GRANT SELECT, UPDATE (status, fixed, fixed_by_pr, fixed_by_sha, fixed_at, fixed_by_run)
-  ON module_replay_incidents TO gate_user;
--- sync-worker role (record side): INSERT rows + set s3_bag_uri after upload
-GRANT INSERT, UPDATE (s3_bag_uri) ON module_replay_incidents TO worker_user;
-```
-
-**(c)** Build the gate connection string and set the secret + test it:
+Set the secret (use the real gate password from the session output):
 
 ```bash
-export INCIDENT_DB_URL="postgresql://gate_user:<gate-pw>@<rds-host>:5432/<db>?sslmode=require"
-psql "$INCIDENT_DB_URL" -c "SELECT count(*) FROM module_replay_incidents;"   # must succeed (0 rows OK)
-gh secret set INCIDENT_DB_URL --repo OriginAutonomy/10xCode --body "$INCIDENT_DB_URL"
+gh secret set INCIDENT_DB_URL --repo OriginAutonomy/10xCode \
+  --body "postgresql://replay_gate:<gate-pw>@database-1.cviscog0koyp.ap-south-1.rds.amazonaws.com/module_replay?sslmode=require"
 ```
 
-`✅ worked when:` the `SELECT count(*)` returns from the **gate_user** connection.
-
-> The gate/sweep **degrade gracefully** if `INCIDENT_DB_URL` is unset — they still verify verdicts and
-> AND-gate, only the RDS UPDATE is skipped. So you can bring CI up golden-path-first and add the DB
-> before B5.
+> **Security posture / honest caveat:** `replay_gate` has **zero object privileges** outside
+> `module_replay_incidents` and is non-superuser, so it cannot read or modify any of the other 20
+> databases. It *can technically* `CONNECT` to them (Postgres grants `CONNECT` to `PUBLIC` by default) —
+> revoking that would mean altering the pre-existing databases' config, which we deliberately did **not**
+> do (owner: don't touch existing DBs). Object-level least privilege is the guarantee that matters here.
+>
+> The gate/sweep also **degrade gracefully** if `INCIDENT_DB_URL` is unset — they still verify verdicts and
+> AND-gate; only the RDS UPDATE is skipped. So the golden path can go live before the secret is set.
 
 ---
 

@@ -304,126 +304,440 @@ The perception gate runs **inside 10xCode's CI** (Path A): the framework is `pip
 library, replay runs on a **RunsOn ephemeral L4 GPU** (sm_89, same arch as the 4080), the image comes
 from **GHCR**, and runtime assets come from **S3**. Five files ship in `module_replay/ci/10xcode/`.
 
-### B0 · Provisioning inventory (`⚙️ you own all of this`)
+**How the gate routes every PR** (from `replay-perception-gate.yml`):
 
-**GitHub secrets (on `OriginAutonomy/10xCode`):**
+```
+ pull_request touching perception/v2/realtime_perception/**   (or workflow_dispatch)
+        │
+        ▼
+ ┌─ detect ── ubuntu-latest, no secrets/GPU ──────────────────────────────────┐
+ │  • dorny/paths-filter → perception = true/false                            │
+ │  • read PR comments → parse_ticked_incident_ids → incident_ids (may be "") │
+ └────────────────────────────────────────────────────────────────────────────┘
+        │ perception==false → replay SKIPS → gate NEUTRAL-PASS
+        │ perception==true (and NOT a fork):
+        ▼
+ ┌─ replay ── RunsOn replay-gpu (GPU) ─ fork-guarded ─────────────────────────┐
+ │  checkout 10xCode PR + framework · GHCR login · pip install[metrics]       │
+ │  · OIDC → stage engine+LUTs+bag into ~/.ros · nvidia-smi · headless setup  │
+ │  · pin /tmp/version.yaml to the PR SHA                                      │
+ │    ├─ incident_ids == ""  → GOLDEN:  replay-module all  --local-bag $BAG    │
+ │    └─ incident_ids != ""  → INCIDENT: psql SELECT s3_bag_uri per id →       │
+ │                             replay-module incident --incident-id <id> …     │
+ │  uploads: output-bag-<run_id>, logs-<run_id>, incident-out-<run_id>         │
+ └────────────────────────────────────────────────────────────────────────────┘
+        │                                   │
+   GOLDEN branch                       INCIDENT branch
+        ▼                                   ▼
+ ┌─ metrics ─ ubuntu-latest ─┐     ┌─ mark ─ ubuntu-latest ─────────────────────┐
+ │ download bag →            │     │ download incident-out → read each           │
+ │ replay-module metrics →   │     │ incident_verdict.verdict → UPDATE RDS        │
+ │ exit 0 iff doc['pass']    │     │ status='fixed' (only if 'fixed'); FAIL if    │
+ └───────────────────────────┘     │ ANY tagged incident is not 'fixed' (D-21)   │
+        │                          └──────────────────────────────────────────────┘
+        └──────────────┬───────────────────┘
+                       ▼
+ ┌─ gate ── always() — THE SINGLE REQUIRED CHECK (job context name: `gate`) ──┐
+ │  replay skipped → pass · golden → require metrics · incident → require mark │
+ └────────────────────────────────────────────────────────────────────────────┘
+```
 
-| Secret | Purpose | Used by |
-|--------|---------|---------|
-| `FRAMEWORK_READ_TOKEN` | read-only PAT to clone the framework repo (cross-org) | all workflows |
-| `DOCKER_DEPLOYMENT_PAT` | pull the planner image from `ghcr.io/originautonomy/*` (org PAT, likely already exists) | gate, sweep, nightly |
-| `INCIDENT_DB_URL` | Postgres conn string (**gate role**: SELECT + UPDATE of status/fixed fields) | gate (resolve + mark), sweep |
+> The **required status check is the job named `gate`** — that one name is all branch protection ever
+> needs, for every future module.
 
-**GitHub repo variables:**
+Work top-to-bottom: **B0 provisioning → B1 RDS → B2 deploy → B3 dry-run → B4 SC2 → B5 incident loop →
+B6 branch protection.** B7 is a troubleshooting matrix.
 
-| Var | Value | Used by |
-|-----|-------|---------|
-| `REPLAY_ROLE_ARN` | OIDC role ARN, S3-read on engine + LUTs + golden + **incident bucket** | gate, sweep, nightly |
-| `PERCEPTION_ENGINE_S3` | `s3://10xai-team-models/segmentation/semantic14/flicker_drywall_x86.trt` (**x86 build!**) | gate, sweep, nightly |
-| `PERCEPTION_BAG_S3` | S3 URI of the curated golden input bag | gate (golden), nightly |
-| `PERCEPTION_BAG_PATH` | runner-local mount for the bag, e.g. `/mnt/efs/bags/perception_ci` | gate (golden), nightly |
+---
 
-> ⚠️ **GOTCHA — regions are inconsistent in the workflows today:** gate + sweep set
-> `aws-region: ap-south-1`; nightly sets `us-east-1`; the engine `aws s3 cp` auto-resolves region.
-> Confirm your buckets are reachable from those regions (or normalize them) — see
-> [Appendix C](#appendix-c--what-changed-vs-the-old-docs). The old docs said `eu-north-1` for the
-> engine bucket — reconcile before first run.
+### B0 · Provisioning — do every sub-step before deploying the workflows
 
-**AWS / infra:**
-- `⚙️` **RunsOn** installed on the org (GitHub App + CloudFormation stack); the **`replay-gpu`** runner
-  profile defined by merging `runs-on.merge.yml` (g6/L4, sm_89, on-demand, 250 GB, `s3-cache+ecr-cache`).
-- `⚙️` **OIDC role** `REPLAY_ROLE_ARN`: trust `token.actions.githubusercontent.com` scoped to
-  `repo:OriginAutonomy/10xCode:*`; `s3:GetObject`+`s3:ListBucket` on the engine bucket, `rosbags-10x`
-  (LUTs/golden), and the incident bag bucket. Read-only. No long-lived keys.
-- `⚙️` **RDS Postgres** with the incidents table (next step).
-- `⚙️` **x86 engine in S3** — confirm `flicker_drywall_x86.trt` is the sm_89/TRT-10.3 build (Stage A3
-  is your proof it loads on x86; if the CI runner TRT minor differs, rebuild per
-  `CI-ENABLEMENT-GUIDE.md` Part 5a).
+Each sub-step ends with **✅ worked when…** so you can checkpoint. Run the `gh`/`aws` commands from a
+shell authenticated to the org (`gh auth status` shows `OriginAutonomy` access; `aws sts
+get-caller-identity` shows account `390403890757`).
 
-### B1 · Create the RDS incidents table (once, by the DB owner)
+#### B0.1 — Confirm RunsOn is installed on the org, then define the `replay-gpu` profile
+
+RunsOn boots the ephemeral GPU EC2. It's installed **once per org** (a GitHub App on `OriginAutonomy`
++ a CloudFormation stack in the AWS account). 10xSim already uses it (`sim-gpu`), so it almost
+certainly exists.
+
+- **Confirm:** open any recent 10xSim Actions run that used `runs-on=…/runner=sim-gpu` → it got a
+  machine (not stuck "Queued").
+- **If missing:** follow runs-on.com's install (CloudFormation one-click in the org AWS account +
+  install the GitHub App). One-time platform task.
+
+Then add the `replay-gpu` profile by **merging** `runs-on.merge.yml` into 10xCode's `.github/runs-on.yml`
+(this is part of B2, previewed here so you know what it is):
+
+```yaml
+# .github/runs-on.yml  — ADD this block under the existing `runners:` key; do NOT overwrite the file
+runners:
+  # ... 10xCode's existing sim-gpu etc. stay here ...
+  replay-gpu:
+    family: ["g6"]              # NVIDIA L4 — Ada sm_89, same arch as the RTX 4080 (engine loads as-is)
+    image: ubuntu24-gpu-x64     # NVIDIA drivers preinstalled
+    cpu: [16]                   # colcon build of perception is CPU-bound
+    spot: false                 # on-demand: a blocking gate must not lose its machine
+    volume: 250gb               # ~20 GB image + ~25 GB output bag + build tree
+    extras: s3-cache+ecr-cache  # pip cache + Docker-layer cache (the ~20 GB image isn't re-pulled)
+```
+
+`✅ worked when:` a 10xSim `sim-gpu` run provisioned a machine, and you have the `replay-gpu` block
+ready to merge.
+
+#### B0.2 — Create the two GitHub PATs
+
+1. **`FRAMEWORK_READ_TOKEN`** (read-only clone of the framework, cross-org until it moves in-org):
+   GitHub → your **Settings → Developer settings → Fine-grained tokens → Generate** → Resource owner
+   = you/`saranshshankar`, Repository access = **only `Replay-Framework`**, Permissions →
+   **Contents: Read-only**. Copy the token.
+2. **`DOCKER_DEPLOYMENT_PAT`** (pull the planner image from GHCR): the org almost certainly already
+   has this (it's what `v2-docker-ci.yml` uses to push). It needs **`read:packages`** on
+   `ghcr.io/originautonomy/*`. If reusing the org one, just confirm it's readable from 10xCode Actions.
+
+`✅ worked when:` you hold both token strings (you'll set them as secrets in B0.6).
+
+#### B0.3 — Create the S3-read OIDC role → `REPLAY_ROLE_ARN`
+
+The privileged `replay` job needs short-lived S3 read creds (no long-lived keys). This is the only AWS
+role in the system, and it touches **S3 only** (the image is on GHCR).
+
+**(a)** Ensure the GitHub OIDC identity provider exists in the account (create once if not):
 
 ```bash
-psql "$INCIDENT_DB_URL_ADMIN" -f module_replay/ci/infra/incidents_table.sql
+aws iam list-open-id-connect-providers   # look for token.actions.githubusercontent.com
+# if absent:
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
 ```
 
-`✅ EXPECT:` table `module_replay_incidents` + two indexes (`module_name,status` and `error_code`),
-idempotent (`IF NOT EXISTS`). Then grant least-privilege roles:
+**(b)** Trust policy — scope it to the 10xCode repo (`trust.json`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::390403890757:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:OriginAutonomy/10xCode:*" }
+    }
+  }]
+}
+```
+
+**(c)** Permissions policy — S3 read on the three buckets (`perms.json`). Replace `<INCIDENT_BUCKET>`
+with your incident-bag bucket name:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:ListBucket"],
+    "Resource": [
+      "arn:aws:s3:::10xai-team-models",       "arn:aws:s3:::10xai-team-models/*",
+      "arn:aws:s3:::rosbags-10x",             "arn:aws:s3:::rosbags-10x/*",
+      "arn:aws:s3:::<INCIDENT_BUCKET>",       "arn:aws:s3:::<INCIDENT_BUCKET>/*"
+    ]
+  }]
+}
+```
+
+**(d)** Create the role + attach the policy, and capture the ARN:
+
+```bash
+aws iam create-role --role-name replay-perception-ci \
+  --assume-role-policy-document file://trust.json
+aws iam put-role-policy --role-name replay-perception-ci \
+  --policy-name s3-read --policy-document file://perms.json
+aws iam get-role --role-name replay-perception-ci --query 'Role.Arn' --output text   # → REPLAY_ROLE_ARN
+```
+
+> ⚠️ **Region note (reconcile the doc drift):** the workflows set `aws-region: ap-south-1` (gate/sweep)
+> and `us-east-1` (nightly), the LUT sync forces `--region us-east-1`, and the engine `aws s3 cp`
+> auto-resolves. S3 `GetObject` works cross-region, so the *assume-region* doesn't gate bucket access —
+> but confirm the engine bucket's real region (old docs said `eu-north-1`). If a stage step 400s on
+> region, add `--region <bucket-region>` there.
+
+`✅ worked when:` `aws iam get-role` prints an ARN, and a quick `aws s3 ls s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/`
+under that role lists the LUT dirs.
+
+#### B0.4 — Confirm/point the x86 engine → `PERCEPTION_ENGINE_S3`
+
+An x86 build already exists (uploaded 2026-06-22):
+`s3://10xai-team-models/segmentation/semantic14/flicker_drywall_x86.trt` (~57 MB). **Stage A3 is its
+real load-test** — if A3 loaded `flicker_drywall.trt` on your box, an sm_89 build is proven. If the L4
+runner's TRT minor differs from the box, rebuild once from the ONNX (see `CI-ENABLEMENT-GUIDE.md`
+Part 5a: `polygraphy surgeon sanitize --fold-constants` → `trtexec --fp16 --saveEngine=…` with dynamic
+batch 1–6) and re-upload.
+
+`✅ worked when:` `aws s3 ls <PERCEPTION_ENGINE_S3>` shows the x86 `.trt`, and A3 proved it deserializes.
+
+#### B0.5 — Curate the golden input bag → `PERCEPTION_BAG_S3` + `PERCEPTION_BAG_PATH`
+
+Pick the bag the golden gate replays every clean PR (start with your 6-cam `rosbag_20260618_125310`;
+upload it to S3). Set `PERCEPTION_BAG_S3` to its S3 URI and `PERCEPTION_BAG_PATH` to the runner-local
+sync target (e.g. `/mnt/efs/bags/perception_ci`). LUTs need no upload — they're already at
+`s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/` (the workflow remaps them into
+`~/.ros/perception/calibration/...`).
+
+`✅ worked when:` `aws s3 ls <PERCEPTION_BAG_S3>` shows a rosbag2 (`metadata.yaml` + `*.mcap`).
+
+#### B0.6 — Set every secret + variable on 10xCode
+
+Via `gh` (or the UI: **Settings → Secrets and variables → Actions**):
+
+```bash
+R=OriginAutonomy/10xCode
+# secrets
+gh secret   set FRAMEWORK_READ_TOKEN --repo $R --body "<the fine-grained PAT>"
+gh secret   set DOCKER_DEPLOYMENT_PAT --repo $R --body "<org GHCR PAT>"   # skip if already org-wide
+gh secret   set INCIDENT_DB_URL       --repo $R --body "<set in B1>"       # set after RDS exists
+# variables
+gh variable set REPLAY_ROLE_ARN       --repo $R --body "arn:aws:iam::390403890757:role/replay-perception-ci"
+gh variable set PERCEPTION_ENGINE_S3  --repo $R --body "s3://10xai-team-models/segmentation/semantic14/flicker_drywall_x86.trt"
+gh variable set PERCEPTION_BAG_S3     --repo $R --body "<curated bag S3 URI>"
+gh variable set PERCEPTION_BAG_PATH   --repo $R --body "/mnt/efs/bags/perception_ci"
+```
+
+`✅ worked when:` `gh secret list --repo $R` and `gh variable list --repo $R` show all seven names.
+
+---
+
+### B1 · Create the RDS incidents table + roles → set `INCIDENT_DB_URL`
+
+**(a)** Apply the DDL once (as a DB admin/owner):
+
+```bash
+psql "postgresql://<admin>:<pw>@<rds-host>:5432/<db>" -f module_replay/ci/infra/incidents_table.sql
+```
+
+`✅ EXPECT:` table `module_replay_incidents` + two indexes (`module_name,status`, `error_code`),
+idempotent (`IF NOT EXISTS`).
+
+**(b)** Create least-privilege roles and grant:
 
 ```sql
--- gate role (the connection string in INCIDENT_DB_URL):
+CREATE ROLE gate_user   LOGIN PASSWORD '<gate-pw>';
+CREATE ROLE worker_user LOGIN PASSWORD '<worker-pw>';
+-- gate role: SELECT + narrow UPDATE (exactly the columns the mark/sweep jobs write)
 GRANT SELECT, UPDATE (status, fixed, fixed_by_pr, fixed_by_sha, fixed_at, fixed_by_run)
-  ON module_replay_incidents TO <gate_role>;
--- sync-worker role (record side, populates s3_bag_uri):
-GRANT INSERT, UPDATE (s3_bag_uri) ON module_replay_incidents TO <worker_role>;
+  ON module_replay_incidents TO gate_user;
+-- sync-worker role (record side): INSERT rows + set s3_bag_uri after upload
+GRANT INSERT, UPDATE (s3_bag_uri) ON module_replay_incidents TO worker_user;
 ```
 
-> The gate **degrades gracefully** if `INCIDENT_DB_URL` is unset (it verifies verdicts but skips the
-> RDS mark), so you can bring CI up golden-path-first and add the DB later.
+**(c)** Build the gate connection string and set the secret + test it:
 
-### B2 · Deploy the workflows + merge the RunsOn fragment
+```bash
+export INCIDENT_DB_URL="postgresql://gate_user:<gate-pw>@<rds-host>:5432/<db>?sslmode=require"
+psql "$INCIDENT_DB_URL" -c "SELECT count(*) FROM module_replay_incidents;"   # must succeed (0 rows OK)
+gh secret set INCIDENT_DB_URL --repo OriginAutonomy/10xCode --body "$INCIDENT_DB_URL"
+```
 
-Copy into `OriginAutonomy/10xCode/.github/workflows/`:
+`✅ worked when:` the `SELECT count(*)` returns from the **gate_user** connection.
 
-- `replay-perception-gate.yml` — the PR gate (golden + incident branches; single required check)
-- `replay-perception-sweep.yml` — weekly QA-cut sweep (reopen-on-reproduce)
-- `replay-perception-nightly.yml` — daily smoke + two-run determinism
-- `replay-perception-viz.yml` — on-demand Tier-3 viz (CPU, `workflow_dispatch` with a `run_id`)
+> The gate/sweep **degrade gracefully** if `INCIDENT_DB_URL` is unset — they still verify verdicts and
+> AND-gate, only the RDS UPDATE is skipped. So you can bring CI up golden-path-first and add the DB
+> before B5.
 
-**MERGE** (do not overwrite) the `replay-gpu:` block from `runs-on.merge.yml` into 10xCode's existing
-`.github/runs-on.yml` under `runners:` — this preserves 10xCode's live `sim-gpu` profiles.
+---
 
-> ⚠️ The gate triggers on `pull_request` (never `pull_request_target`) filtered to
-> `perception/v2/realtime_perception/**`; a privileged (GPU/secrets) job runs **only if**
-> `head.repo.full_name == github.repository` (fork guard). Confirm the path filter matches where
-> perception actually lives in 10xCode.
+### B2 · Deploy the workflows + merge the RunsOn fragment (one PR into 10xCode)
 
-### B3 · Dry-run each workflow via `workflow_dispatch`
+On a branch in 10xCode:
 
-Before wiring branch protection, run each manually from the Actions tab:
+```bash
+# from a 10xCode checkout, with the framework repo available at ../Replay-Framework
+cp ../Replay-Framework/module_replay/ci/10xcode/replay-perception-gate.yml    .github/workflows/
+cp ../Replay-Framework/module_replay/ci/10xcode/replay-perception-sweep.yml   .github/workflows/
+cp ../Replay-Framework/module_replay/ci/10xcode/replay-perception-nightly.yml .github/workflows/
+cp ../Replay-Framework/module_replay/ci/10xcode/replay-perception-viz.yml     .github/workflows/
+# MERGE the replay-gpu block into the existing runs-on.yml (do NOT overwrite — see B0.1)
+$EDITOR .github/runs-on.yml
+```
 
-- **gate** (`workflow_dispatch`): with no incident tags → exercises detect → **golden** replay →
-  metrics → gate. `✅ EXPECT` green; artifacts uploaded (output bag, logs, report).
-- **nightly** (`workflow_dispatch`): `✅ EXPECT` smoke green + determinism deltas within tolerance.
-- **viz** (`workflow_dispatch` with the gate's `run_id`): `✅ EXPECT` mp4 artifacts.
+Then open a PR titled e.g. `ci: add perception replay gate + incident loop`.
 
-### B4 · SC2 — live red/green on real PRs
+Two things to confirm in that PR:
+- **Path filter matches reality:** the gate triggers on `perception/v2/realtime_perception/**` (gate
+  line 22). If perception lives elsewhere in 10xCode, edit the `paths:` and the `dorny/paths-filter`
+  `filters:` block to match.
+- **`perception_sim.yaml` model currency** (Blocker 1): the branch/`dev` must point at
+  `flicker_drywall.trt` for the node to activate. The gate pins `/tmp/version.yaml` to the PR SHA, so
+  the PR's own `perception_sim.yaml` is what's used.
 
-1. **Clean PR** touching `perception/v2/realtime_perception/**` with a harmless change →
-   `✅ EXPECT` **gate green** (golden path: detect → replay → metrics → gate).
-2. **Bad PR** that regresses perception (e.g. break the segmenter output) →
-   `✅ EXPECT` **gate red** (metrics exit 1), with `report.html` in the run artifacts + the
-   `$GITHUB_STEP_SUMMARY` dev link.
-3. **Untouched PR** (no perception files) → `✅ EXPECT` gate **neutral-skips** (green, replay skipped).
+`✅ worked when:` the PR shows the 4 workflow files + the merged `runs-on.yml`, and 10xCode's existing
+CI stays green.
 
-`📸 CAPTURE:` links to the green run, the red run, and the neutral-skip run.
+---
 
-### B5 · SC-INCIDENT (live) — the full incident loop
+### B3 · Dry-run each workflow via `workflow_dispatch` (before branch protection)
 
-1. `⚙️` Seed one incident row in RDS with a real `s3_bag_uri` pointing at a bag that reproduces a
-   known perception failure (`status='open'`, `module_name='perception'`).
-2. `⚙️` Post the PR **incident checklist** comment (rendered by `ci/incident_checklist.py`, carrying
-   the `<!-- module-replay-incident-checklist -->` marker) and **tick** the incident's box.
-3. Open a PR that *fixes* that incident.
-   `✅ EXPECT:` detect picks up the ticked `incident_id` → the **incident branch** stages the bag from
-   S3, replays it with `replay-module incident --incident-id …`, the **`mark`** job reads
-   `incident_verdict.verdict`, and — only if `fixed` — UPDATEs the row to `status='fixed'` and the
-   gate passes. A `not_fixed` verdict → mark fails → gate red (incident still reproduces).
-4. **Sweep** (`workflow_dispatch`): `✅ EXPECT` it replays all open incident bags (dedup by
-   `error_code`) and **reopens** any that reproduce, failing the QA-cut.
+From 10xCode → **Actions**, "Run workflow" on each:
 
-### B6 · Branch protection
+```bash
+gh workflow run replay-perception-gate.yml    --repo OriginAutonomy/10xCode   # golden path (no incidents)
+gh workflow run replay-perception-nightly.yml --repo OriginAutonomy/10xCode
+gh workflow run replay-perception-viz.yml     --repo OriginAutonomy/10xCode -f run_id=<a gate run id>
+gh run watch --repo OriginAutonomy/10xCode $(gh run list --repo OriginAutonomy/10xCode -w replay-perception-gate.yml -L1 --json databaseId -q '.[0].databaseId')
+```
 
-Make **`gate`** the single required status check on the protected branch(es). Adding future modules
-never changes this (each module ships its own `gate` job that consolidates to one check).
+`✅ EXPECT:`
+- **gate**: `replay` provisions a GPU (you'll see `nvidia-smi` in the log) → produces `replay_output`
+  → uploads `output-bag-<run_id>` → `metrics` downloads it, computes, exits on `doc['pass']` →
+  `gate` green (or a trustworthy INVALID/FAIL with `report-<run_id>` attached). The run **Summary**
+  lists the artifact names.
+- **nightly**: smoke replay green + the determinism step passes (or names the metric that drifted
+  beyond its `tolerance_band`).
+- **viz**: `viz-<run_id>` mp4 artifacts.
+
+If anything fails here, jump to **B7** — do not proceed to branch protection until the golden dry-run
+is green.
+
+---
+
+### B4 · SC2 — live red / green / neutral on real PRs
+
+1. **Clean PR** touching `perception/v2/realtime_perception/**` (a harmless change) →
+   `✅ EXPECT` **gate green** (detect→replay→metrics→gate, golden path).
+2. **Bad PR** that regresses perception (e.g. force the segmenter to emit ~no foreground, or tighten
+   nothing but break an output) → `✅ EXPECT` **gate red** — `metrics` exits 1 on `doc['pass']==false`;
+   `report-<run_id>` shows which quality metric failed; the `$GITHUB_STEP_SUMMARY` links the artifacts.
+3. **Untouched PR** (no perception files) → `✅ EXPECT` **neutral pass** — `detect.perception==false`,
+   `replay` skips, `gate` exits 0.
+
+Read the result from the `gate` check on the PR, or:
+
+```bash
+gh pr checks <PR#> --repo OriginAutonomy/10xCode   # the line named `gate` is the one that matters
+```
+
+`📸 CAPTURE:` the run URLs for the green, red, and neutral PRs (SC2 evidence).
+
+---
+
+### B5 · SC-INCIDENT (live) — the full incident loop, end to end
+
+This proves detect→incident-replay→`mark`→RDS, in both the `fixed` and `not_fixed` directions, plus
+the sweep. You'll drive the incident bag + the checklist comment manually (the auto-posting record-side
+workflow `incident-checklist.yml` is part of the 10xCode record-side PRs, not this deployable set).
+
+**B5.1 — Seed one open incident in RDS**, pointing at a bag that reproduces a known failure (e.g. an
+all-background segmentation bag → trips `seg_all_background`):
+
+```sql
+INSERT INTO module_replay_incidents
+  (incident_id, module_name, status, s3_bag_uri, error_code, title, ts)
+VALUES
+  ('INC-20260701-1200-segcollapse', 'perception', 'open',
+   's3://<INCIDENT_BUCKET>/incidents/perception/INC-20260701-1200-segcollapse/',
+   'SEG-COLLAPSE', 'Segmentation collapsed to all-background', now());
+```
+
+> ⚠️ The `incident_id` must match `[A-Za-z0-9_-]+` — the checklist parser drops anything else at the
+> source (CR-01 SQL-injection guard). And the bag at `s3_bag_uri` must be a rosbag2 dir the OIDC role
+> can read.
+
+**B5.2 — Post the PR checklist comment** (the exact marker the gate greps for — the first line is
+mandatory), and tick the incident:
+
+```bash
+cat > /tmp/checklist.md <<'MD'
+<!-- module-replay-incident-checklist -->
+## Open incidents for `perception`
+
+- [x] INC-20260701-1200-segcollapse — Segmentation collapsed to all-background (SEG-COLLAPSE)
+MD
+gh pr comment <PR#> --repo OriginAutonomy/10xCode --body-file /tmp/checklist.md
+```
+
+**B5.3 — The PR that *fixes* the incident.** With that ticked comment present, push the fix to the PR
+(touching `perception/v2/realtime_perception/**` so `detect` fires). What happens:
+
+- `detect` → `incident_ids = "INC-20260701-1200-segcollapse"` (non-empty → **incident branch**).
+- `replay` → `psql SELECT s3_bag_uri` for that id → `aws s3 cp` the bag → `replay-module incident
+  --incident-bag <staged> --incident-id INC-… --version-yaml /tmp/version.yaml` → writes
+  `incident-out-<run_id>/INC-…/reports/metrics.json` with `incident_verdict`.
+- `mark` → reads `incident_verdict.verdict`; if **`fixed`** → `UPDATE … SET status='fixed', fixed=true,
+  fixed_by_pr=<PR#>, … WHERE incident_id=… AND status<>'fixed'`; if **`not_fixed`/`inconclusive`** →
+  the job **fails** (gate red).
+
+`✅ EXPECT (fix works):` gate **green**; then confirm the RDS row flipped:
+
+```bash
+psql "$INCIDENT_DB_URL" -c \
+  "SELECT incident_id,status,fixed,fixed_by_pr,fixed_by_sha FROM module_replay_incidents WHERE incident_id='INC-20260701-1200-segcollapse';"
+# → status=fixed, fixed=t, fixed_by_pr=<PR#>
+```
+
+**B5.4 — Prove the `not_fixed` teeth.** Repeat B5.1–B5.3 but point `s3_bag_uri` at a bag that *still*
+reproduces the failure (or open the fixing PR against code that doesn't actually fix it).
+`✅ EXPECT:` `mark` fails → **gate red**; the RDS row stays `status='open'`; the run's
+`incident-out-<run_id>` shows `verdict: not_fixed`, `tripped: ["seg_all_background"]`.
+
+**B5.5 — Sweep (fixed-stays-fixed).** With at least one open incident whose bag reproduces:
+
+```bash
+gh workflow run replay-perception-sweep.yml --repo OriginAutonomy/10xCode -f module=perception
+```
+
+`✅ EXPECT:` the sweep `SELECT DISTINCT ON (error_code)` picks the open incidents, replays each, and on
+a `not_fixed` verdict runs `UPDATE … SET status='open', fixed=false` and **fails the job** (blocking a
+QA cut). Green only when nothing reproduces.
+
+`📸 CAPTURE:` the RDS row before/after, and the green (fixed) + red (not_fixed) + sweep run URLs.
+
+---
+
+### B6 · Branch protection — make `gate` required
+
+GitHub → 10xCode → **Settings → Branches → (protected branch) → Require status checks to pass** →
+search and select **`gate`**. Or via API:
+
+```bash
+gh api -X PATCH repos/OriginAutonomy/10xCode/branches/<branch>/protection/required_status_checks \
+  -f 'contexts[]=gate'
+```
+
+`✅ worked when:` a red `gate` blocks the merge button on a regressing perception PR; a green `gate`
+(or a neutral-skip) lets it merge. Adding a future module never changes this — each ships its own
+`gate` job under the same context name.
+
+---
+
+### B7 · Troubleshooting matrix (first-run failures)
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `replay` stuck **"Queued"** | RunsOn not picking up the `replay-gpu` label | Re-check B0.1; ensure `runs-on.yml` is at `.github/runs-on.yml` on the branch being run; confirm the org RunsOn stack covers 10xCode |
+| `replay` fails at **preflight, exit 3** | a staged asset path is missing | The log **names the exact path**. Check the OIDC role can read it (B0.3), the engine/LUT/bag S3 URIs (B0.4/B0.5), and the `~/.ros` remap |
+| **Engine won't deserialize** on the runner | ARM engine, or TRT-minor mismatch vs the L4 | Ensure `PERCEPTION_ENGINE_S3` is the **x86/sm_89** build; rebuild on an L4 if the TRT minor differs (Part 5a) |
+| Node **ACTIVATE-FAIL** / missing model | `perception_sim.yaml` names the old `L2_L4_segformer` (Blocker 1) or non-contiguous cam ids (B1) | Repoint the PR's `perception_sim.yaml` at `flicker_drywall.trt`; renumber cameras to `0..5` |
+| **GHCR login/pull fails** | `DOCKER_DEPLOYMENT_PAT` not visible to 10xCode or lacks `read:packages`, or the package hasn't granted 10xCode read | Fix the secret/scope; grant the planner package read access to 10xCode |
+| **OIDC `AssumeRoleWithWebIdentity` denied** | trust `sub` doesn't match, or provider missing | Confirm the trust `sub` is `repo:OriginAutonomy/10xCode:*` and the OIDC provider exists (B0.3a) |
+| **psql** connection refused / auth | RDS security group, sslmode, or `gate_user` grants | Test `psql "$INCIDENT_DB_URL" -c 'select 1'` from a runner-like network; add `?sslmode=require`; re-check B1 grants |
+| gate is **green but should've caught a regression** | the regression isn't in a **gated** metric (e.g. `depth_validity` is ungated by design) | Confirm which metric moved; only gated thresholds fail the golden gate — see Appendix B |
+| privileged jobs **skipped on a PR** | the PR is from a **fork** (fork guard `head.repo==repo`) | Push the branch internally to 10xCode; forks intentionally can't get GPU/secrets |
+| gate **runs on an unrelated PR** / doesn't run on a perception PR | `paths:` filter mismatch | Align the `paths:` + `dorny/paths-filter` block with where perception lives (B2) |
+
+---
 
 ### Stage B exit criteria
 
-- [ ] B0 provisioning complete; B1 RDS table + grants applied
-- [ ] B2 workflows deployed; RunsOn fragment merged (not overwritten)
-- [ ] B3 all four workflows dry-run green via dispatch
-- [ ] B4 SC2 — clean PR green, bad PR red, untouched PR neutral-skip
-- [ ] B5 incident loop marks `fixed` live; sweep reopens a reproduced incident
-- [ ] B6 `gate` is the required check
+- [ ] B0 provisioning complete (RunsOn `replay-gpu`, both PATs, OIDC role, engine, bag, all 7 vars/secrets)
+- [ ] B1 RDS table + `gate_user`/`worker_user` grants applied; `INCIDENT_DB_URL` set + tested
+- [ ] B2 4 workflows deployed; RunsOn fragment **merged** (not overwritten); path filter confirmed
+- [ ] B3 gate/nightly/viz dry-run green via dispatch
+- [ ] B4 SC2 — clean PR green, bad PR red, untouched PR neutral-skip (URLs captured)
+- [ ] B5 incident loop: `fixed` marks RDS + gate green; `not_fixed` blocks + stays open; sweep reopens
+- [ ] B6 `gate` is the single required check; red blocks merge
 
 ---
 

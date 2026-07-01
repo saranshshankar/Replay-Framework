@@ -156,7 +156,7 @@ jobs:
       - name: Configure AWS (S3 READ on the asset + incident buckets)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.REPLAY_ROLE_ARN }}   # read on 10xai-team-models + rosbags-10x + incident bucket
+          role-to-assume: ${{ vars.REPLAY_ROLE_ARN }}   # read on replay-framework-assets + incident bucket
           aws-region: ap-south-1
       - name: Stage engine + LUTs into ~/.ros (bind-mounted into the container)
         run: |
@@ -166,10 +166,10 @@ jobs:
           # PERCEPTION_ENGINE_S3 must point at an x86 / sm_89 / TRT-10.3 build of the SAME model,
           # built once from the ONNX (guide Part 5a) and uploaded. aws s3 cp auto-resolves region.
           aws s3 cp "${{ vars.PERCEPTION_ENGINE_S3 }}" ~/.ros/perception/models/flicker_drywall.trt
-          # LUTs: the bucket path has NO 'calibration/' segment, but SIM needs one — remap into
-          # perception/calibration/camera_intrinsics/ (perception_sim.yaml:64). 6 cams (~85MB ea).
-          aws s3 sync --region us-east-1 \
-            s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/ \
+          # LUTs → perception/calibration/camera_intrinsics/ (perception_sim.yaml:64). 6 cams (~85MB ea),
+          # staged from the consolidated replay-framework-assets bucket (ap-south-1, job region).
+          aws s3 sync \
+            s3://replay-framework-assets/perception_assets/calibration/camera_intrinsics/ \
             ~/.ros/perception/calibration/camera_intrinsics/
           # Input bag — NOT in either prefix above; point PERCEPTION_BAG_S3 at the curated bag.
           aws s3 sync "${{ vars.PERCEPTION_BAG_S3 }}" "$BAG"

@@ -40,16 +40,16 @@ jobs:
       - run: pip install -e "./replay-framework/module_replay[metrics]"
       # Stage runtime assets into ~/.ros (engine/LUTs not in the image — guide Part 10)
       - uses: aws-actions/configure-aws-credentials@v4
-        with: { role-to-assume: "${{ vars.REPLAY_ROLE_ARN }}", aws-region: us-east-1 }
+        with: { role-to-assume: "${{ vars.REPLAY_ROLE_ARN }}", aws-region: ap-south-1 }
       - name: Stage engine + LUTs + bag into ~/.ros
         run: |
           mkdir -p ~/.ros/perception/models ~/.ros/perception/calibration/camera_intrinsics
           # x86/sm_89/TRT-10.3 engine — NOT the ARM s3://10xai-team-models/.../flicker_drywall.trt (guide Part 5a)
           aws s3 cp "${{ vars.PERCEPTION_ENGINE_S3 }}" ~/.ros/perception/models/flicker_drywall.trt
-          aws s3 sync --region us-east-1 \
-            s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/ \
+          aws s3 sync \
+            s3://replay-framework-assets/perception_assets/calibration/camera_intrinsics/ \
             ~/.ros/perception/calibration/camera_intrinsics/
-          aws s3 sync --region us-east-1 "${{ vars.PERCEPTION_BAG_S3 }}" "$BAG"
+          aws s3 sync "${{ vars.PERCEPTION_BAG_S3 }}" "$BAG"
 
       - name: Smoke replay one fixed bag + assert green
         run: |

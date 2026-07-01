@@ -55,10 +55,10 @@ constant-folding the RoPE `If` nodes out of the ONNX, then `trtexec` — F6). Tw
 on-box: **`flicker_drywall.trt` (good)** and `eomt_semantic.trt` (bad) — make sure the good one is
 staged.
 
-> ⚠️ **GOTCHA:** the ARM/Orin engine in S3 (`s3://10xai-team-models/segmentation/semantic14/flicker_drywall.trt`)
-> will **not** deserialize on the L4/x86 CI runner. The x86 build lives at
-> `…/semantic14/flicker_drywall_x86.trt` (uploaded 2026-06-22) — that one is for **CI** (Stage B),
-> and Stage A's local run is its first real x86 load-test proof.
+> ⚠️ **GOTCHA:** the ARM/Orin engine that used to sit in `s3://10xai-team-models/segmentation/semantic14/`
+> will **not** deserialize on the L4/x86 CI runner. **CI (Stage B) now pulls the x86/sm_89 build Stage A
+> proved**, from the consolidated bucket: `s3://replay-framework-assets/perception_assets/flicker_drywall.trt`
+> (staged 2026-07-01). Stage A's local run was its first real x86 load-test proof.
 
 ---
 
@@ -465,7 +465,7 @@ aws iam create-open-id-connect-provider \
 }
 ```
 
-**(c)** Permissions policy — S3 read on the three buckets (`perms.json`). Replace `<INCIDENT_BUCKET>`
+**(c)** Permissions policy — S3 read on the asset + incident buckets (`perms.json`). Replace `<INCIDENT_BUCKET>`
 with your incident-bag bucket name:
 
 ```json
@@ -475,8 +475,7 @@ with your incident-bag bucket name:
     "Effect": "Allow",
     "Action": ["s3:GetObject", "s3:ListBucket"],
     "Resource": [
-      "arn:aws:s3:::10xai-team-models",       "arn:aws:s3:::10xai-team-models/*",
-      "arn:aws:s3:::rosbags-10x",             "arn:aws:s3:::rosbags-10x/*",
+      "arn:aws:s3:::replay-framework-assets", "arn:aws:s3:::replay-framework-assets/*",
       "arn:aws:s3:::<INCIDENT_BUCKET>",       "arn:aws:s3:::<INCIDENT_BUCKET>/*"
     ]
   }]
@@ -493,33 +492,35 @@ aws iam put-role-policy --role-name replay-perception-ci \
 aws iam get-role --role-name replay-perception-ci --query 'Role.Arn' --output text   # → REPLAY_ROLE_ARN
 ```
 
-> ⚠️ **Region note (reconcile the doc drift):** the workflows set `aws-region: ap-south-1` (gate/sweep)
-> and `us-east-1` (nightly), the LUT sync forces `--region us-east-1`, and the engine `aws s3 cp`
-> auto-resolves. S3 `GetObject` works cross-region, so the *assume-region* doesn't gate bucket access —
-> but confirm the engine bucket's real region (old docs said `eu-north-1`). If a stage step 400s on
-> region, add `--region <bucket-region>` there.
+> ✔ **Region (reconciled 2026-07-01):** all perception assets now live in the single
+> `replay-framework-assets` bucket in **`ap-south-1`**, and all three workflows (gate/sweep/nightly)
+> assume `ap-south-1` with no per-command `--region` overrides — so there is no cross-region access left.
+> If you stage assets in a different-region bucket later, either set that job's `aws-region` to match or
+> add `--region <bucket-region>` on the specific `aws s3` step.
 
-`✅ worked when:` `aws iam get-role` prints an ARN, and a quick `aws s3 ls s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/`
+`✅ worked when:` `aws iam get-role` prints an ARN, and a quick `aws s3 ls s3://replay-framework-assets/perception_assets/calibration/camera_intrinsics/`
 under that role lists the LUT dirs.
 
 #### B0.4 — Confirm/point the x86 engine → `PERCEPTION_ENGINE_S3`
 
-An x86 build already exists (uploaded 2026-06-22):
-`s3://10xai-team-models/segmentation/semantic14/flicker_drywall_x86.trt` (~57 MB). **Stage A3 is its
-real load-test** — if A3 loaded `flicker_drywall.trt` on your box, an sm_89 build is proven. If the L4
-runner's TRT minor differs from the box, rebuild once from the ONNX (see `CI-ENABLEMENT-GUIDE.md`
-Part 5a: `polygraphy surgeon sanitize --fold-constants` → `trtexec --fp16 --saveEngine=…` with dynamic
-batch 1–6) and re-upload.
+The exact sm_89 engine Stage A3 loaded on the box is now staged in the consolidated bucket (2026-07-01):
+`s3://replay-framework-assets/perception_assets/flicker_drywall.trt` (~57 MB) — point `PERCEPTION_ENGINE_S3`
+at it. **A3 is its real load-test:** it deserialized on the RTX 4080 (sm_89, same arch as the L4 runner),
+so no rebuild is needed. (Only if a future L4's TRT minor differs would you rebuild from the ONNX per
+`CI-ENABLEMENT-GUIDE.md` Part 5a: `polygraphy surgeon sanitize --fold-constants` → `trtexec --fp16
+--saveEngine=…` dynamic batch 1–6, then re-upload.) `eomt_semantic.trt` sits beside it as the known-bad
+counter-example — do NOT point the var at that one.
 
-`✅ worked when:` `aws s3 ls <PERCEPTION_ENGINE_S3>` shows the x86 `.trt`, and A3 proved it deserializes.
+`✅ worked when:` `aws s3 ls <PERCEPTION_ENGINE_S3>` shows the `.trt`, and A3 proved it deserializes.
 
 #### B0.5 — Curate the golden input bag → `PERCEPTION_BAG_S3` + `PERCEPTION_BAG_PATH`
 
-Pick the bag the golden gate replays every clean PR (start with your 6-cam `rosbag_20260618_125310`;
-upload it to S3). Set `PERCEPTION_BAG_S3` to its S3 URI and `PERCEPTION_BAG_PATH` to the runner-local
-sync target (e.g. `/mnt/efs/bags/perception_ci`). LUTs need no upload — they're already at
-`s3://rosbags-10x/planner_v2_ros/.ros/perception/camera_intrinsics/` (the workflow remaps them into
-`~/.ros/perception/calibration/...`).
+The 6-cam `rosbag_20260618_125310` (the bag Stage A3/A7 used) is already staged (2026-07-01) at
+`s3://replay-framework-assets/rosbags/rosbag_20260618_125310/` — set `PERCEPTION_BAG_S3` to it and
+`PERCEPTION_BAG_PATH` to the runner-local sync target (e.g. `/mnt/efs/bags/perception_ci`). LUTs also
+need no upload — they're in the same bucket at
+`s3://replay-framework-assets/perception_assets/calibration/camera_intrinsics/` (the workflow syncs them
+into `~/.ros/perception/calibration/...`).
 
 `✅ worked when:` `aws s3 ls <PERCEPTION_BAG_S3>` shows a rosbag2 (`metadata.yaml` + `*.mcap`).
 
@@ -535,8 +536,8 @@ gh secret   set DOCKER_DEPLOYMENT_PAT --repo $R --body "<org GHCR PAT>"   # skip
 gh secret   set INCIDENT_DB_URL       --repo $R --body "<set in B1>"       # set after RDS exists
 # variables
 gh variable set REPLAY_ROLE_ARN       --repo $R --body "arn:aws:iam::390403890757:role/replay-perception-ci"
-gh variable set PERCEPTION_ENGINE_S3  --repo $R --body "s3://10xai-team-models/segmentation/semantic14/flicker_drywall_x86.trt"
-gh variable set PERCEPTION_BAG_S3     --repo $R --body "<curated bag S3 URI>"
+gh variable set PERCEPTION_ENGINE_S3  --repo $R --body "s3://replay-framework-assets/perception_assets/flicker_drywall.trt"
+gh variable set PERCEPTION_BAG_S3     --repo $R --body "s3://replay-framework-assets/rosbags/rosbag_20260618_125310/"
 gh variable set PERCEPTION_BAG_PATH   --repo $R --body "/mnt/efs/bags/perception_ci"
 ```
 
@@ -841,8 +842,10 @@ they need these fixes (tracked as a phase-01.2 doc-reconciliation task):
    the real preflight asset is `flicker_drywall.trt` (EoMT swap).
 5. **Metric count:** `CODE-WALKTHROUGH.md` self-contradicts (7 vs 6); it's **6**.
 6. **Test count:** "166 passed" is stale (~363 now).
-7. **AWS regions:** docs say `eu-north-1` engine / `us-east-1` LUTs; live workflows use `ap-south-1`
-   (gate/sweep) and `us-east-1` (nightly). Reconcile.
+7. **AWS regions & buckets (reconciled 2026-07-01):** all perception CI assets (engine, LUTs, golden
+   bag) are consolidated into `s3://replay-framework-assets` (**`ap-south-1`**); gate/sweep/nightly all
+   assume `ap-south-1` with no `--region` overrides. The old `eu-north-1`/`us-east-1`/`rosbags-10x`
+   references are superseded.
 
 ---
 
